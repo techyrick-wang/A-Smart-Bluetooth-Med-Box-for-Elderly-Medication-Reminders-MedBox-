@@ -1,0 +1,8413 @@
+/*
+  ================================================================
+                    MEDKIT V4.7 - XIAO ESP32-S3
+                  DIRECT WIFI + OLD API BUILD
+  ================================================================
+
+  TFT ST7789 240x240
+  -----------------
+  GND   -> GND
+  VCC   -> 3V3
+  SCK   -> D8  / GPIO7
+  MOSI  -> D10 / GPIO9
+  RST   -> D5  / GPIO6
+  DC    -> D4  / GPIO5
+  CS    -> D7  / GPIO44
+  BLK   -> D9  / GPIO8
+
+  BUTTONS
+  -------
+  CONFIRM -> D0 / GPIO1 -> button -> GND
+  CLEAR   -> D1 / GPIO2 -> button -> GND
+  UP      -> D2 / GPIO3 -> button -> GND
+  DOWN    -> D3 / GPIO4 -> button -> GND
+
+  BUZZER
+  ------
+  SIGNAL -> D6 / GPIO43
+  GND    -> GND
+
+  LIBRARIES
+  ---------
+  ArduinoJson
+  Adafruit GFX Library
+  Adafruit ST7735 and ST7789 Library
+  Adafruit BusIO
+
+  ESP32 core provides:
+  WiFi
+  HTTPClient
+  Preferences
+  qrcode
+
+  Serial Monitor: 115200
+  ================================================================
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include <ArduinoJson.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+
+#include <Preferences.h>
+
+#include <time.h>
+#include <math.h>
+
+#include <esp_err.h>
+#include <qrcode.h>
+
+#include "esp_arduino_version.h"
+
+// ================================================================
+// YOUR NORMAL WIFI
+// ================================================================
+
+const char* WIFI_SSID =
+  "EIM Technology";
+
+const char* WIFI_PASSWORD =
+  "eim@2016";
+
+// ================================================================
+// PINS
+// ================================================================
+
+#define TFT_SCLK 7
+#define TFT_MOSI 9
+#define TFT_RST 6
+#define TFT_DC 5
+#define TFT_CS 44
+#define TFT_BL 8
+
+#define BTN_CONFIRM 1
+#define BTN_CLEAR 2
+#define BTN_UP 3
+#define BTN_DOWN 4
+
+#define BUZZER_PIN 43
+
+#define SCREEN_W 240
+#define SCREEN_H 240
+
+// ================================================================
+// DISPLAY / STORAGE
+// ================================================================
+
+Adafruit_ST7789 tft(
+  TFT_CS,
+  TFT_DC,
+  TFT_RST
+);
+
+Preferences prefs;
+
+// ================================================================
+// THEME
+// ================================================================
+
+bool lightTheme = false;
+
+#define C_BG       (lightTheme ? ST77XX_WHITE : ST77XX_BLACK)
+#define C_TEXT     (lightTheme ? ST77XX_BLACK : ST77XX_WHITE)
+#define C_HEADER   (lightTheme ? ST77XX_BLUE : ST77XX_CYAN)
+#define C_CARD     (lightTheme ? 0xDEFB : 0x2104)
+#define C_GREY     (lightTheme ? 0x630C : 0x8410)
+#define C_DARKGREY (lightTheme ? 0xDEFB : 0x4208)
+
+#define C_GREEN ST77XX_GREEN
+#define C_YELLOW ST77XX_YELLOW
+#define C_RED ST77XX_RED
+#define C_MAGENTA ST77XX_MAGENTA
+
+// ================================================================
+// UI
+// ================================================================
+
+bool uiDirty = true;
+
+int lastClockMinute = -1;
+
+unsigned long lastTimerSecond =
+  0xFFFFFFFFUL;
+
+void redraw() {
+  uiDirty = true;
+}
+
+// ================================================================
+// BUTTON CLASS
+// ================================================================
+
+struct Button {
+  uint8_t pin = 0;
+
+  bool raw = HIGH;
+  bool previousRaw = HIGH;
+  bool stable = HIGH;
+
+  unsigned long changedAt = 0;
+
+  bool queuedPress = false;
+
+  void begin(uint8_t newPin) {
+    pin = newPin;
+
+    pinMode(
+      pin,
+      INPUT_PULLUP
+    );
+
+    raw = digitalRead(pin);
+    previousRaw = raw;
+    stable = raw;
+
+    changedAt = millis();
+  }
+
+  void update() {
+    raw =
+      digitalRead(pin);
+
+    if (
+      raw !=
+      previousRaw
+    ) {
+      previousRaw = raw;
+      changedAt = millis();
+    }
+
+    if (
+      millis() -
+      changedAt >=
+      30
+    ) {
+      if (
+        raw !=
+        stable
+      ) {
+        stable = raw;
+
+        if (
+          stable ==
+          LOW
+        ) {
+          queuedPress = true;
+        }
+      }
+    }
+  }
+
+  bool pressed() {
+    if (
+      !queuedPress
+    ) {
+      return false;
+    }
+
+    queuedPress = false;
+
+    return true;
+  }
+};
+
+Button confirmButton;
+Button clearButton;
+Button upButton;
+Button downButton;
+
+// ================================================================
+// WIFI
+// ================================================================
+
+bool wifiWasConnected = false;
+
+unsigned long lastWifiRetry = 0;
+
+const unsigned long WIFI_RETRY_MS =
+  10000UL;
+
+// ================================================================
+// INTERNET
+// ================================================================
+
+bool refreshRequested = false;
+
+unsigned long lastInternetAttempt = 0;
+unsigned long lastWeatherRefresh = 0;
+
+const unsigned long INTERNET_RETRY_MS =
+  60000UL;
+
+const unsigned long WEATHER_REFRESH_MS =
+  10UL *
+  60UL *
+  1000UL;
+
+// ================================================================
+// LOCATION
+// ================================================================
+
+String locationName =
+  "UNKNOWN";
+
+String regionName =
+  "";
+
+String countryName =
+  "";
+
+String locationTimezone =
+  "";
+
+double latitude = 0.0;
+double longitude = 0.0;
+
+bool locationReady = false;
+bool manualLocation = false;
+
+// ================================================================
+// WEATHER
+// ================================================================
+
+bool weatherReady = false;
+
+float temperatureC = 0;
+float feelsLikeC = 0;
+float humidityPercent = 0;
+float windKmh = 0;
+
+float rainChance = 0;
+float uvIndex = 0;
+
+int weatherCode = -1;
+
+String weatherText =
+  "UNKNOWN";
+
+long weatherUtcOffset =
+  0;
+
+// ================================================================
+// CLOCK
+// ================================================================
+
+bool clockReady = false;
+
+unsigned long lastClockCheck = 0;
+
+const char* NTP1 =
+  "pool.ntp.org";
+
+const char* NTP2 =
+  "time.google.com";
+
+const char* NTP3 =
+  "time.cloudflare.com";
+
+const char* DEFAULT_TZ =
+  "PST8PDT,M3.2.0,M11.1.0";
+
+// ================================================================
+// BUZZER
+// ================================================================
+
+bool buzzerReady = false;
+
+// ================================================================
+// MEDICATIONS
+// ================================================================
+
+const int MED_COUNT = 3;
+
+const char* medNames[MED_COUNT] = {
+  "MORNING",
+  "AFTERNOON",
+  "NIGHT"
+};
+
+int medHour[MED_COUNT] = {
+  8,
+  13,
+  20
+};
+
+int medMinute[MED_COUNT] = {
+  0,
+  0,
+  0
+};
+
+bool medTaken[MED_COUNT] = {
+  false,
+  false,
+  false
+};
+
+bool medAlerted[MED_COUNT] = {
+  false,
+  false,
+  false
+};
+
+bool medSkipped[MED_COUNT] = {
+  false,
+  false,
+  false
+};
+
+unsigned long medSnoozeUntil[MED_COUNT] = {
+  0,
+  0,
+  0
+};
+
+int medStock[MED_COUNT] = {
+  -1,
+  -1,
+  -1
+};
+
+int medLow[MED_COUNT] = {
+  5,
+  5,
+  5
+};
+
+int medicationDay = -1;
+
+int activeMedication = -1;
+
+int medMenuSelection = 0;
+int medStatusSelection = 0;
+int medStockSelection = 0;
+
+int editMedSlot = -1;
+int editMedField = 0;
+
+int editHour = 0;
+int editMinute = 0;
+
+// ================================================================
+// TIMER
+// ================================================================
+
+const unsigned long timerPresetSeconds[] = {
+  30,
+  60,
+  300,
+  600,
+  1200,
+  1800
+};
+
+const char* timerPresetNames[] = {
+  "30 SECONDS",
+  "1 MINUTE",
+  "5 MINUTES",
+  "10 MINUTES",
+  "20 MINUTES",
+  "30 MINUTES"
+};
+
+const int TIMER_COUNT = 6;
+
+int timerSelection = 0;
+
+bool timerRunning = false;
+
+unsigned long timerStartedAt = 0;
+unsigned long timerDurationMs = 0;
+
+// ================================================================
+// KIT
+// ================================================================
+
+const char* kitItems[] = {
+  "BANDAGES",
+  "GAUZE",
+  "ANTISEPTIC",
+  "GLOVES",
+  "MED TAPE",
+  "COLD PACK",
+  "SCISSORS",
+  "MED CARD"
+};
+
+const int KIT_COUNT = 8;
+
+bool kitChecked[KIT_COUNT] = {
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false
+};
+
+int kitSelection = 0;
+
+// ================================================================
+// EMERGENCY CARD
+// ================================================================
+
+String cardName =
+  "SET NAME";
+
+String cardContact =
+  "SET CONTACT";
+
+String cardAllergies =
+  "SET ALLERGIES";
+
+String cardMeds =
+  "SET MEDS";
+
+String emergencyPhone =
+  "";
+
+// ================================================================
+// FIRST AID
+// ================================================================
+
+const char* aidTitles[] = {
+  "MINOR CUT",
+  "BURN",
+  "NOSEBLEED",
+  "SPRAIN"
+};
+
+const int AID_COUNT = 4;
+
+int aidSelection = 0;
+
+// ================================================================
+// PHARMACY
+// ================================================================
+
+struct Pharmacy {
+  String name;
+  String address;
+  String phone;
+  String hours;
+
+  double lat;
+  double lon;
+
+  float distanceKm;
+};
+
+const int MAX_PHARMACIES = 5;
+
+Pharmacy pharmacies[MAX_PHARMACIES];
+
+int pharmacyCount = 0;
+int pharmacySelection = 0;
+
+bool pharmacySearchDone = false;
+
+String pharmacyMessage =
+  "PRESS CONFIRM";
+
+// ================================================================
+// SCREENS
+// ================================================================
+
+enum ScreenID {
+  SCREEN_HOME,
+  SCREEN_MENU,
+
+  SCREEN_WEATHER,
+
+  SCREEN_MED_MENU,
+  SCREEN_MED_EDIT,
+  SCREEN_MED_STATUS,
+  SCREEN_MED_STOCK,
+
+  SCREEN_TIMER_SELECT,
+  SCREEN_TIMER_RUNNING,
+
+  SCREEN_KIT,
+
+  SCREEN_PHARMACY_LIST,
+  SCREEN_PHARMACY_DETAIL,
+
+  SCREEN_EMERGENCY,
+
+  SCREEN_AID_MENU,
+  SCREEN_AID_VIEW,
+
+  SCREEN_LOCATION,
+
+  SCREEN_ALERT_TEST,
+
+  SCREEN_DEVICE,
+
+  SCREEN_QR,
+
+  SCREEN_ALARM
+};
+
+int currentScreen =
+  SCREEN_HOME;
+
+int qrReturnScreen =
+  SCREEN_HOME;
+
+// ================================================================
+// MENU
+// ================================================================
+
+const char* menuItems[] = {
+  "WEATHER",
+  "MED SCHEDULE",
+  "TIMER",
+  "KIT CHECK",
+  "PHARMACY",
+  "EMERGENCY",
+  "FIRST AID",
+  "LOCATION",
+  "ALERT TEST",
+  "DEVICE"
+};
+
+const int MENU_COUNT = 10;
+
+int menuSelection = 0;
+
+// ================================================================
+// ALARM
+// ================================================================
+
+bool alarmActive = false;
+
+int alarmReason = 0;
+int alarmStep = 0;
+
+unsigned long lastAlarmTone = 0;
+
+// ================================================================
+// QR
+// ================================================================
+
+String qrPayload = "";
+String qrFooter = "";
+
+// ================================================================
+// SERIAL
+// ================================================================
+
+String serialBuffer = "";
+
+// ================================================================
+// DISPLAY HELPERS
+// ================================================================
+
+void clearDisplay() {
+  tft.fillScreen(
+    C_BG
+  );
+
+  tft.setTextWrap(
+    false
+  );
+
+  tft.setTextColor(
+    C_TEXT
+  );
+}
+
+String shortenText(
+  String text,
+  int maxLength
+) {
+  if (
+    (int)text.length() <=
+    maxLength
+  ) {
+    return text;
+  }
+
+  if (
+    maxLength <=
+    3
+  ) {
+    return
+      text.substring(
+        0,
+        maxLength
+      );
+  }
+
+  return
+    text.substring(
+      0,
+      maxLength - 3
+    ) +
+    "...";
+}
+
+void centeredText(
+  String text,
+  int y,
+  int size,
+  uint16_t color = C_TEXT
+) {
+  tft.setTextSize(size);
+
+  tft.setTextColor(color);
+
+  int width =
+    text.length() *
+    6 *
+    size;
+
+  int x =
+    (
+      SCREEN_W -
+      width
+    ) /
+    2;
+
+  if (
+    x <
+    0
+  ) {
+    x = 0;
+  }
+
+  tft.setCursor(
+    x,
+    y
+  );
+
+  tft.print(
+    text
+  );
+}
+
+void drawCard(
+  int x,
+  int y,
+  int w,
+  int h
+) {
+  tft.fillRoundRect(
+    x,
+    y,
+    w,
+    h,
+    7,
+    C_CARD
+  );
+
+  tft.drawRoundRect(
+    x,
+    y,
+    w,
+    h,
+    7,
+    C_GREY
+  );
+}
+
+void menuRow(
+  int y,
+  String text,
+  bool selected
+) {
+  if (
+    selected
+  ) {
+    tft.fillRoundRect(
+      6,
+      y - 4,
+      228,
+      30,
+      6,
+      C_HEADER
+    );
+
+    tft.setTextColor(
+      C_BG
+    );
+  } else {
+    tft.setTextColor(
+      C_TEXT
+    );
+  }
+
+  tft.setTextSize(2);
+
+  tft.setCursor(
+    14,
+    y + 2
+  );
+
+  if (
+    selected
+  ) {
+    tft.print(
+      "> "
+    );
+  } else {
+    tft.print(
+      "  "
+    );
+  }
+
+  tft.print(text);
+}
+
+void wrappedText(
+  String text,
+  int x,
+  int y,
+  int charsPerLine,
+  int lineHeight,
+  int maxLines
+) {
+  tft.setTextSize(1);
+
+  tft.setTextColor(
+    C_TEXT
+  );
+
+  int start = 0;
+
+  for (
+    int line = 0;
+    line < maxLines;
+    line++
+  ) {
+    if (
+      start >=
+      (int)text.length()
+    ) {
+      break;
+    }
+
+    int end =
+      start +
+      charsPerLine;
+
+    if (
+      end >
+      (int)text.length()
+    ) {
+      end =
+        text.length();
+    }
+
+    if (
+      end <
+      (int)text.length()
+    ) {
+      int space =
+        text.lastIndexOf(
+          ' ',
+          end
+        );
+
+      if (
+        space >
+        start
+      ) {
+        end = space;
+      }
+    }
+
+    String part =
+      text.substring(
+        start,
+        end
+      );
+
+    part.trim();
+
+    tft.setCursor(
+      x,
+      y +
+      line *
+      lineHeight
+    );
+
+    tft.print(part);
+
+    start = end;
+
+    while (
+      start <
+      (int)text.length() &&
+      text[start] ==
+      ' '
+    ) {
+      start++;
+    }
+  }
+}
+
+// ================================================================
+// BUZZER
+// ================================================================
+
+void setupBuzzer() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+  buzzerReady =
+    ledcAttach(
+      BUZZER_PIN,
+      2000,
+      8
+    );
+
+#else
+
+  ledcSetup(
+    0,
+    2000,
+    8
+  );
+
+  ledcAttachPin(
+    BUZZER_PIN,
+    0
+  );
+
+  buzzerReady = true;
+
+#endif
+}
+
+void buzzerOn(
+  int frequency
+) {
+  if (
+    !buzzerReady
+  ) {
+    return;
+  }
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+  ledcWriteTone(
+    BUZZER_PIN,
+    frequency
+  );
+
+#else
+
+  ledcWriteTone(
+    0,
+    frequency
+  );
+
+#endif
+}
+
+void buzzerOff() {
+  if (
+    !buzzerReady
+  ) {
+    return;
+  }
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+  ledcWriteTone(
+    BUZZER_PIN,
+    0
+  );
+
+#else
+
+  ledcWriteTone(
+    0,
+    0
+  );
+
+#endif
+}
+
+void clickBeep() {
+  buzzerOn(
+    2200
+  );
+
+  delay(12);
+
+  buzzerOff();
+}
+
+void successBeep() {
+  buzzerOn(
+    1600
+  );
+
+  delay(30);
+
+  buzzerOn(
+    2600
+  );
+
+  delay(50);
+
+  buzzerOff();
+}
+
+void errorBeep() {
+  buzzerOn(
+    500
+  );
+
+  delay(120);
+
+  buzzerOff();
+}
+
+// ================================================================
+// WIFI
+// ================================================================
+
+String wifiStatusText() {
+  switch (
+    WiFi.status()
+  ) {
+    case WL_CONNECTED:
+      return
+        "CONNECTED";
+
+    case WL_NO_SSID_AVAIL:
+      return
+        "SSID NOT FOUND";
+
+    case WL_CONNECT_FAILED:
+      return
+        "FAILED";
+
+    case WL_CONNECTION_LOST:
+      return
+        "LOST";
+
+    case WL_DISCONNECTED:
+      return
+        "DISCONNECTED";
+
+    case WL_IDLE_STATUS:
+      return
+        "IDLE";
+
+    default:
+      return
+        String(
+          WiFi.status()
+        );
+  }
+}
+
+void connectWiFi() {
+  Serial.println();
+
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "MEDKIT DIRECT WIFI"
+  );
+
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.print(
+    "Connecting to: "
+  );
+
+  Serial.println(
+    WIFI_SSID
+  );
+
+  WiFi.mode(
+    WIFI_STA
+  );
+
+  WiFi.setAutoReconnect(
+    true
+  );
+
+  WiFi.disconnect();
+
+  delay(200);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  unsigned long started =
+    millis();
+
+  while (
+    WiFi.status() !=
+    WL_CONNECTED &&
+    millis() -
+    started <
+    20000UL
+  ) {
+    Serial.print(
+      "."
+    );
+
+    delay(500);
+  }
+
+  Serial.println();
+
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  ) {
+    wifiWasConnected =
+      true;
+
+    Serial.println(
+      "WIFI CONNECTED"
+    );
+
+    Serial.print(
+      "SSID: "
+    );
+
+    Serial.println(
+      WiFi.SSID()
+    );
+
+    Serial.print(
+      "IP: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+    Serial.print(
+      "RSSI: "
+    );
+
+    Serial.println(
+      WiFi.RSSI()
+    );
+
+    refreshRequested =
+      true;
+
+    successBeep();
+  } else {
+    wifiWasConnected =
+      false;
+
+    Serial.println(
+      "WIFI FAILED"
+    );
+
+    Serial.print(
+      "STATUS: "
+    );
+
+    Serial.println(
+      wifiStatusText()
+    );
+
+    errorBeep();
+  }
+}
+
+void serviceWiFi() {
+  bool connected =
+    WiFi.status() ==
+    WL_CONNECTED;
+
+  if (
+    connected &&
+    !wifiWasConnected
+  ) {
+    wifiWasConnected =
+      true;
+
+    Serial.println(
+      "WIFI RECONNECTED"
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+    refreshRequested =
+      true;
+
+    redraw();
+  }
+
+  if (
+    !connected &&
+    wifiWasConnected
+  ) {
+    wifiWasConnected =
+      false;
+
+    Serial.println(
+      "WIFI LOST"
+    );
+
+    redraw();
+  }
+
+  if (
+    !connected &&
+    millis() -
+    lastWifiRetry >=
+    WIFI_RETRY_MS
+  ) {
+    lastWifiRetry =
+      millis();
+
+    Serial.println(
+      "RETRYING WIFI..."
+    );
+
+    WiFi.disconnect();
+
+    delay(100);
+
+    WiFi.begin(
+      WIFI_SSID,
+      WIFI_PASSWORD
+    );
+  }
+}
+
+// ================================================================
+// URL ENCODING
+// ================================================================
+
+String urlEncode(
+  String input
+) {
+  String output = "";
+
+  for (
+    unsigned int i = 0;
+    i < input.length();
+    i++
+  ) {
+    char c =
+      input.charAt(i);
+
+    bool safe =
+      (
+        c >= 'a' &&
+        c <= 'z'
+      ) ||
+      (
+        c >= 'A' &&
+        c <= 'Z'
+      ) ||
+      (
+        c >= '0' &&
+        c <= '9'
+      ) ||
+      c == '-' ||
+      c == '_' ||
+      c == '.' ||
+      c == '~';
+
+    if (
+      safe
+    ) {
+      output += c;
+    } else {
+      char encoded[4];
+
+      sprintf(
+        encoded,
+        "%%%02X",
+        (unsigned char)c
+      );
+
+      output +=
+        encoded;
+    }
+  }
+
+  return output;
+}
+
+// ================================================================
+// CLOCK
+// ================================================================
+
+void startClock() {
+  configTzTime(
+    DEFAULT_TZ,
+    NTP1,
+    NTP2,
+    NTP3
+  );
+
+  clockReady =
+    false;
+}
+
+void serviceClock() {
+  if (
+    !WiFi.isConnected()
+  ) {
+    return;
+  }
+
+  if (
+    millis() -
+    lastClockCheck <
+    1000
+  ) {
+    return;
+  }
+
+  lastClockCheck =
+    millis();
+
+  struct tm info;
+
+  if (
+    getLocalTime(
+      &info,
+      5
+    )
+  ) {
+    if (
+      !clockReady
+    ) {
+      clockReady =
+        true;
+
+      Serial.println(
+        "CLOCK READY"
+      );
+
+      redraw();
+    }
+  }
+}
+
+void drawTopBar() {
+  tft.fillRect(
+    0,
+    0,
+    240,
+    31,
+    C_DARKGREY
+  );
+
+  tft.drawFastHLine(
+    0,
+    31,
+    240,
+    C_HEADER
+  );
+
+  tft.setTextSize(
+    2
+  );
+
+  tft.setTextColor(
+    C_HEADER
+  );
+
+  if (
+    clockReady
+  ) {
+    struct tm info;
+
+    if (
+      getLocalTime(
+        &info,
+        3
+      )
+    ) {
+      char timeBuffer[12];
+
+      strftime(
+        timeBuffer,
+        sizeof(timeBuffer),
+        "%I:%M",
+        &info
+      );
+
+      String timeText =
+        timeBuffer;
+
+      if (
+        timeText.startsWith(
+          "0"
+        )
+      ) {
+        timeText.remove(
+          0,
+          1
+        );
+      }
+
+      char ampm[3];
+
+      strftime(
+        ampm,
+        sizeof(ampm),
+        "%p",
+        &info
+      );
+
+      timeText +=
+        " ";
+
+      timeText +=
+        ampm;
+
+      tft.setCursor(
+        6,
+        8
+      );
+
+      tft.print(
+        timeText
+      );
+
+      char dateBuffer[12];
+
+      strftime(
+        dateBuffer,
+        sizeof(dateBuffer),
+        "%b %d",
+        &info
+      );
+
+      String dateText =
+        dateBuffer;
+
+      int x =
+        235 -
+        dateText.length() *
+        12;
+
+      tft.setCursor(
+        x,
+        8
+      );
+
+      tft.print(
+        dateText
+      );
+
+      return;
+    }
+  }
+
+  tft.setCursor(
+    6,
+    8
+  );
+
+  tft.print(
+    "MEDKIT"
+  );
+
+  tft.setCursor(
+    178,
+    8
+  );
+
+  if (
+    WiFi.isConnected()
+  ) {
+    tft.print(
+      "NET"
+    );
+  } else {
+    tft.print(
+      "OFF"
+    );
+  }
+}
+
+// ================================================================
+// LOCATION STORAGE
+// ================================================================
+
+void saveLocation() {
+  prefs.putBool(
+    "hasloc",
+    true
+  );
+
+  prefs.putString(
+    "locname",
+    locationName
+  );
+
+  prefs.putString(
+    "region",
+    regionName
+  );
+
+  prefs.putString(
+    "country",
+    countryName
+  );
+
+  prefs.putString(
+    "timezone",
+    locationTimezone
+  );
+
+  prefs.putDouble(
+    "lat",
+    latitude
+  );
+
+  prefs.putDouble(
+    "lon",
+    longitude
+  );
+}
+
+bool loadLocation() {
+  if (
+    !prefs.getBool(
+      "hasloc",
+      false
+    )
+  ) {
+    return false;
+  }
+
+  locationName =
+    prefs.getString(
+      "locname",
+      "UNKNOWN"
+    );
+
+  regionName =
+    prefs.getString(
+      "region",
+      ""
+    );
+
+  countryName =
+    prefs.getString(
+      "country",
+      ""
+    );
+
+  locationTimezone =
+    prefs.getString(
+      "timezone",
+      ""
+    );
+
+  latitude =
+    prefs.getDouble(
+      "lat",
+      0
+    );
+
+  longitude =
+    prefs.getDouble(
+      "lon",
+      0
+    );
+
+  if (
+    latitude == 0 &&
+    longitude == 0
+  ) {
+    return false;
+  }
+
+  locationReady =
+    true;
+
+  manualLocation =
+    true;
+
+  return true;
+}
+
+// ================================================================
+// REALLYFREEGEOIP
+// ================================================================
+
+bool fetchIPLocation() {
+  if (
+    !WiFi.isConnected()
+  ) {
+    Serial.println(
+      "LOCATION: WIFI OFFLINE"
+    );
+
+    return false;
+  }
+
+  Serial.println();
+
+  Serial.println(
+    "LOCATION API REQUEST"
+  );
+
+  WiFiClientSecure client;
+
+  client.setInsecure();
+
+  HTTPClient http;
+
+  String url =
+    "https://reallyfreegeoip.org/json/";
+
+  if (
+    !http.begin(
+      client,
+      url
+    )
+  ) {
+    Serial.println(
+      "LOCATION HTTP BEGIN FAILED"
+    );
+
+    return false;
+  }
+
+  http.setTimeout(
+    10000
+  );
+
+  http.setFollowRedirects(
+    HTTPC_FORCE_FOLLOW_REDIRECTS
+  );
+
+  http.addHeader(
+    "User-Agent",
+    "MedKit-XIAO-V47"
+  );
+
+  http.addHeader(
+    "Accept",
+    "application/json"
+  );
+
+  int code =
+    http.GET();
+
+  Serial.print(
+    "Location HTTP: "
+  );
+
+  Serial.println(
+    code
+  );
+
+  if (
+    code !=
+    HTTP_CODE_OK
+  ) {
+    if (
+      code <
+      0
+    ) {
+      Serial.print(
+        "LOCATION NETWORK ERROR: "
+      );
+
+      Serial.println(
+        HTTPClient::errorToString(
+          code
+        )
+      );
+    }
+
+    http.end();
+
+    return false;
+  }
+
+  String payload =
+    http.getString();
+
+  http.end();
+
+  JsonDocument doc;
+
+  DeserializationError error =
+    deserializeJson(
+      doc,
+      payload
+    );
+
+  if (
+    error
+  ) {
+    Serial.print(
+      "LOCATION JSON ERROR: "
+    );
+
+    Serial.println(
+      error.c_str()
+    );
+
+    return false;
+  }
+
+  double newLat =
+    doc["latitude"] |
+    0.0;
+
+  double newLon =
+    doc["longitude"] |
+    0.0;
+
+  if (
+    newLat ==
+    0 &&
+    newLon ==
+    0
+  ) {
+    Serial.println(
+      "NO COORDINATES"
+    );
+
+    return false;
+  }
+
+  latitude =
+    newLat;
+
+  longitude =
+    newLon;
+
+  locationName =
+    doc["city"] |
+    "UNKNOWN";
+
+  regionName =
+    doc["region_name"] |
+    "";
+
+  countryName =
+    doc["country_name"] |
+    "";
+
+  locationTimezone =
+    doc["time_zone"] |
+    "";
+
+  locationReady =
+    true;
+
+  manualLocation =
+    false;
+
+  Serial.print(
+    "LOCATION OK: "
+  );
+
+  Serial.print(
+    locationName
+  );
+
+  Serial.print(
+    " "
+  );
+
+  Serial.print(
+    latitude,
+    6
+  );
+
+  Serial.print(
+    ","
+  );
+
+  Serial.println(
+    longitude,
+    6
+  );
+
+  redraw();
+
+  return true;
+}
+
+// ================================================================
+// MANUAL LOCATION SEARCH
+// ================================================================
+
+bool geocodeLocation(
+  String search
+) {
+  if (
+    !WiFi.isConnected()
+  ) {
+    return false;
+  }
+
+  search.trim();
+
+  String url =
+    "https://geocoding-api.open-meteo.com/v1/search?name=";
+
+  url +=
+    urlEncode(
+      search
+    );
+
+  url +=
+    "&count=1&language=en&format=json";
+
+  WiFiClientSecure client;
+
+  client.setInsecure();
+
+  HTTPClient http;
+
+  if (
+    !http.begin(
+      client,
+      url
+    )
+  ) {
+    return false;
+  }
+
+  http.setTimeout(
+    10000
+  );
+
+  http.setFollowRedirects(
+    HTTPC_FORCE_FOLLOW_REDIRECTS
+  );
+
+  int code =
+    http.GET();
+
+  Serial.print(
+    "Geocode HTTP: "
+  );
+
+  Serial.println(
+    code
+  );
+
+  if (
+    code !=
+    HTTP_CODE_OK
+  ) {
+    http.end();
+
+    return false;
+  }
+
+  String payload =
+    http.getString();
+
+  http.end();
+
+  JsonDocument doc;
+
+  if (
+    deserializeJson(
+      doc,
+      payload
+    )
+  ) {
+    return false;
+  }
+
+  JsonArray results =
+    doc["results"]
+      .as<JsonArray>();
+
+  if (
+    results.isNull() ||
+    results.size() ==
+    0
+  ) {
+    return false;
+  }
+
+  JsonObject result =
+    results[0];
+
+  locationName =
+    result["name"] |
+    search;
+
+  regionName =
+    result["admin1"] |
+    "";
+
+  countryName =
+    result["country"] |
+    "";
+
+  latitude =
+    result["latitude"] |
+    0.0;
+
+  longitude =
+    result["longitude"] |
+    0.0;
+
+  locationTimezone =
+    result["timezone"] |
+    "";
+
+  locationReady =
+    true;
+
+  manualLocation =
+    true;
+
+  saveLocation();
+
+  redraw();
+
+  return true;
+}
+
+// ================================================================
+// WEATHER CODE
+// ================================================================
+
+String weatherName(
+  int code
+) {
+  if (
+    code ==
+    0
+  ) return "CLEAR";
+
+  if (
+    code ==
+    1
+  ) return "MOSTLY CLEAR";
+
+  if (
+    code ==
+    2
+  ) return "PARTLY CLOUDY";
+
+  if (
+    code ==
+    3
+  ) return "CLOUDY";
+
+  if (
+    code ==
+    45 ||
+    code ==
+    48
+  ) return "FOG";
+
+  if (
+    code >=
+    51 &&
+    code <=
+    57
+  ) return "DRIZZLE";
+
+  if (
+    code >=
+    61 &&
+    code <=
+    67
+  ) return "RAIN";
+
+  if (
+    code >=
+    71 &&
+    code <=
+    77
+  ) return "SNOW";
+
+  if (
+    code >=
+    80 &&
+    code <=
+    82
+  ) return "SHOWERS";
+
+  if (
+    code >=
+    95
+  ) return "THUNDER";
+
+  return "UNKNOWN";
+}
+
+// ================================================================
+// OPEN-METEO WEATHER
+// ================================================================
+
+bool fetchWeather() {
+  if (
+    !WiFi.isConnected()
+  ) {
+    Serial.println(
+      "WEATHER: WIFI OFFLINE"
+    );
+
+    return false;
+  }
+
+  if (
+    !locationReady
+  ) {
+    Serial.println(
+      "WEATHER: NO LOCATION"
+    );
+
+    return false;
+  }
+
+  String url =
+    "https://api.open-meteo.com/v1/forecast?latitude=";
+
+  url +=
+    String(
+      latitude,
+      6
+    );
+
+  url +=
+    "&longitude=";
+
+  url +=
+    String(
+      longitude,
+      6
+    );
+
+  url +=
+    "&current="
+    "temperature_2m,"
+    "relative_humidity_2m,"
+    "apparent_temperature,"
+    "weather_code,"
+    "wind_speed_10m";
+
+  url +=
+    "&daily="
+    "precipitation_probability_max,"
+    "uv_index_max";
+
+  url +=
+    "&forecast_days=1"
+    "&timezone=auto";
+
+  Serial.println();
+
+  Serial.println(
+    "WEATHER API REQUEST"
+  );
+
+  WiFiClientSecure client;
+
+  client.setInsecure();
+
+  HTTPClient http;
+
+  if (
+    !http.begin(
+      client,
+      url
+    )
+  ) {
+    Serial.println(
+      "WEATHER BEGIN FAILED"
+    );
+
+    return false;
+  }
+
+  http.setTimeout(
+    10000
+  );
+
+  http.setFollowRedirects(
+    HTTPC_FORCE_FOLLOW_REDIRECTS
+  );
+
+  http.addHeader(
+    "User-Agent",
+    "MedKit-XIAO-V47"
+  );
+
+  int code =
+    http.GET();
+
+  Serial.print(
+    "Weather HTTP: "
+  );
+
+  Serial.println(
+    code
+  );
+
+  if (
+    code !=
+    HTTP_CODE_OK
+  ) {
+    if (
+      code <
+      0
+    ) {
+      Serial.print(
+        "WEATHER NETWORK ERROR: "
+      );
+
+      Serial.println(
+        HTTPClient::errorToString(
+          code
+        )
+      );
+    }
+
+    http.end();
+
+    weatherReady =
+      false;
+
+    return false;
+  }
+
+  String payload =
+    http.getString();
+
+  http.end();
+
+  JsonDocument doc;
+
+  DeserializationError error =
+    deserializeJson(
+      doc,
+      payload
+    );
+
+  if (
+    error
+  ) {
+    Serial.print(
+      "WEATHER JSON ERROR: "
+    );
+
+    Serial.println(
+      error.c_str()
+    );
+
+    weatherReady =
+      false;
+
+    return false;
+  }
+
+  temperatureC =
+    doc["current"]["temperature_2m"] |
+    0.0;
+
+  feelsLikeC =
+    doc["current"]["apparent_temperature"] |
+    0.0;
+
+  humidityPercent =
+    doc["current"]["relative_humidity_2m"] |
+    0.0;
+
+  windKmh =
+    doc["current"]["wind_speed_10m"] |
+    0.0;
+
+  weatherCode =
+    doc["current"]["weather_code"] |
+    -1;
+
+  rainChance =
+    doc["daily"]
+       ["precipitation_probability_max"][0] |
+    0.0;
+
+  uvIndex =
+    doc["daily"]
+       ["uv_index_max"][0] |
+    0.0;
+
+  weatherUtcOffset =
+    doc["utc_offset_seconds"] |
+    0;
+
+  weatherText =
+    weatherName(
+      weatherCode
+    );
+
+  weatherReady =
+    true;
+
+  lastWeatherRefresh =
+    millis();
+
+  configTime(
+    weatherUtcOffset,
+    0,
+    NTP1,
+    NTP2,
+    NTP3
+  );
+
+  Serial.print(
+    "WEATHER OK: "
+  );
+
+  Serial.print(
+    temperatureC,
+    1
+  );
+
+  Serial.print(
+    " C "
+  );
+
+  Serial.println(
+    weatherText
+  );
+
+  redraw();
+
+  return true;
+}
+
+// ================================================================
+// INTERNET SERVICE
+// ================================================================
+
+void refreshInternet() {
+  if (
+    !WiFi.isConnected()
+  ) {
+    return;
+  }
+
+  if (
+    !locationReady
+  ) {
+    if (
+      !loadLocation()
+    ) {
+      fetchIPLocation();
+    }
+  }
+
+  if (
+    locationReady
+  ) {
+    fetchWeather();
+  }
+}
+
+void serviceInternet() {
+  if (
+    !WiFi.isConnected()
+  ) {
+    return;
+  }
+
+  if (
+    refreshRequested &&
+    millis() -
+    lastInternetAttempt >=
+    1000UL
+  ) {
+    refreshRequested =
+      false;
+
+    lastInternetAttempt =
+      millis();
+
+    refreshInternet();
+
+    return;
+  }
+
+  if (
+    weatherReady &&
+    millis() -
+    lastWeatherRefresh >=
+    WEATHER_REFRESH_MS
+  ) {
+    lastWeatherRefresh =
+      millis();
+
+    fetchWeather();
+
+    return;
+  }
+
+  if (
+    !weatherReady &&
+    millis() -
+    lastInternetAttempt >=
+    INTERNET_RETRY_MS
+  ) {
+    lastInternetAttempt =
+      millis();
+
+    refreshInternet();
+  }
+}
+
+// ================================================================
+// MEDICATION TIME
+// ================================================================
+
+String formatMedTime(
+  int hour,
+  int minute
+) {
+  bool pm =
+    hour >=
+    12;
+
+  int hour12 =
+    hour %
+    12;
+
+  if (
+    hour12 ==
+    0
+  ) {
+    hour12 = 12;
+  }
+
+  String output =
+    String(
+      hour12
+    );
+
+  output += ":";
+
+  if (
+    minute <
+    10
+  ) {
+    output += "0";
+  }
+
+  output +=
+    String(
+      minute
+    );
+
+  output +=
+    pm
+      ? " PM"
+      : " AM";
+
+  return output;
+}
+
+// ================================================================
+// MEDICATION STORAGE
+// ================================================================
+
+void saveMedSchedule() {
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    String hk =
+      "mh" +
+      String(i);
+
+    String mk =
+      "mm" +
+      String(i);
+
+    String sk =
+      "stock" +
+      String(i);
+
+    String lk =
+      "low" +
+      String(i);
+
+    prefs.putInt(
+      hk.c_str(),
+      medHour[i]
+    );
+
+    prefs.putInt(
+      mk.c_str(),
+      medMinute[i]
+    );
+
+    prefs.putInt(
+      sk.c_str(),
+      medStock[i]
+    );
+
+    prefs.putInt(
+      lk.c_str(),
+      medLow[i]
+    );
+  }
+}
+
+void loadMedSchedule() {
+  medHour[0] =
+    prefs.getInt(
+      "mh0",
+      8
+    );
+
+  medMinute[0] =
+    prefs.getInt(
+      "mm0",
+      0
+    );
+
+  medHour[1] =
+    prefs.getInt(
+      "mh1",
+      13
+    );
+
+  medMinute[1] =
+    prefs.getInt(
+      "mm1",
+      0
+    );
+
+  medHour[2] =
+    prefs.getInt(
+      "mh2",
+      20
+    );
+
+  medMinute[2] =
+    prefs.getInt(
+      "mm2",
+      0
+    );
+
+  medStock[0] =
+    prefs.getInt(
+      "stock0",
+      -1
+    );
+
+  medStock[1] =
+    prefs.getInt(
+      "stock1",
+      -1
+    );
+
+  medStock[2] =
+    prefs.getInt(
+      "stock2",
+      -1
+    );
+
+  medLow[0] =
+    prefs.getInt(
+      "low0",
+      5
+    );
+
+  medLow[1] =
+    prefs.getInt(
+      "low1",
+      5
+    );
+
+  medLow[2] =
+    prefs.getInt(
+      "low2",
+      5
+    );
+}
+
+int todayKey() {
+  if (
+    !clockReady
+  ) {
+    return -1;
+  }
+
+  struct tm info;
+
+  if (
+    !getLocalTime(
+      &info,
+      5
+    )
+  ) {
+    return -1;
+  }
+
+  return
+    (
+      info.tm_year +
+      1900
+    ) *
+    1000 +
+    info.tm_yday;
+}
+
+void saveMedDay() {
+  prefs.putInt(
+    "medday",
+    medicationDay
+  );
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    String tk =
+      "taken" +
+      String(i);
+
+    String ak =
+      "alert" +
+      String(i);
+
+    String sk =
+      "skip" +
+      String(i);
+
+    prefs.putBool(
+      tk.c_str(),
+      medTaken[i]
+    );
+
+    prefs.putBool(
+      ak.c_str(),
+      medAlerted[i]
+    );
+
+    prefs.putBool(
+      sk.c_str(),
+      medSkipped[i]
+    );
+  }
+}
+
+void resetMedicationDay(
+  int day
+) {
+  medicationDay =
+    day;
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    medTaken[i] =
+      false;
+
+    medAlerted[i] =
+      false;
+
+    medSkipped[i] =
+      false;
+
+    medSnoozeUntil[i] =
+      0;
+  }
+
+  saveMedDay();
+
+  redraw();
+}
+
+void loadMedDay() {
+  int today =
+    todayKey();
+
+  if (
+    today <
+    0
+  ) {
+    return;
+  }
+
+  int stored =
+    prefs.getInt(
+      "medday",
+      -1
+    );
+
+  if (
+    stored !=
+    today
+  ) {
+    resetMedicationDay(
+      today
+    );
+
+    return;
+  }
+
+  medicationDay =
+    today;
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    String tk =
+      "taken" +
+      String(i);
+
+    String ak =
+      "alert" +
+      String(i);
+
+    String sk =
+      "skip" +
+      String(i);
+
+    medTaken[i] =
+      prefs.getBool(
+        tk.c_str(),
+        false
+      );
+
+    medAlerted[i] =
+      prefs.getBool(
+        ak.c_str(),
+        false
+      );
+
+    medSkipped[i] =
+      prefs.getBool(
+        sk.c_str(),
+        false
+      );
+  }
+}
+
+// ================================================================
+// MEDICATION STATE
+// ================================================================
+
+String medStatus(
+  int slot
+) {
+  if (
+    medTaken[slot]
+  ) {
+    return "TAKEN";
+  }
+
+  if (
+    medSkipped[slot]
+  ) {
+    return "SKIP";
+  }
+
+  if (
+    medSnoozeUntil[slot] >
+    millis()
+  ) {
+    return "SNOOZE";
+  }
+
+  if (
+    !clockReady
+  ) {
+    return "WAIT";
+  }
+
+  struct tm info;
+
+  if (
+    !getLocalTime(
+      &info,
+      5
+    )
+  ) {
+    return "WAIT";
+  }
+
+  int now =
+    info.tm_hour *
+    60 +
+    info.tm_min;
+
+  int due =
+    medHour[slot] *
+    60 +
+    medMinute[slot];
+
+  if (
+    now >=
+    due
+  ) {
+    return "DUE";
+  }
+
+  return "WAIT";
+}
+
+void markMedTaken(
+  int slot
+) {
+  if (
+    slot <
+    0 ||
+    slot >=
+    MED_COUNT
+  ) {
+    return;
+  }
+
+  medTaken[slot] =
+    true;
+
+  medAlerted[slot] =
+    true;
+
+  medSkipped[slot] =
+    false;
+
+  medSnoozeUntil[slot] =
+    0;
+
+  if (
+    medStock[slot] >
+    0
+  ) {
+    medStock[slot]--;
+  }
+
+  saveMedDay();
+  saveMedSchedule();
+
+  redraw();
+}
+
+void snoozeMed(
+  int slot
+) {
+  if (
+    slot <
+    0 ||
+    slot >=
+    MED_COUNT
+  ) {
+    return;
+  }
+
+  medAlerted[slot] =
+    true;
+
+  medSnoozeUntil[slot] =
+    millis() +
+    10UL *
+    60UL *
+    1000UL;
+
+  saveMedDay();
+
+  redraw();
+}
+
+void skipMed(
+  int slot
+) {
+  if (
+    slot <
+    0 ||
+    slot >=
+    MED_COUNT
+  ) {
+    return;
+  }
+
+  medSkipped[slot] =
+    true;
+
+  medAlerted[slot] =
+    true;
+
+  medSnoozeUntil[slot] =
+    0;
+
+  saveMedDay();
+
+  redraw();
+}
+
+String nextMedication() {
+  if (
+    !clockReady
+  ) {
+    return
+      "WAITING FOR TIME";
+  }
+
+  struct tm info;
+
+  if (
+    !getLocalTime(
+      &info,
+      5
+    )
+  ) {
+    return
+      "WAITING";
+  }
+
+  int now =
+    info.tm_hour *
+    60 +
+    info.tm_min;
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    if (
+      medTaken[i] ||
+      medSkipped[i]
+    ) {
+      continue;
+    }
+
+    if (
+      medSnoozeUntil[i] >
+      millis()
+    ) {
+      unsigned long minutes =
+        (
+          medSnoozeUntil[i] -
+          millis()
+        ) /
+        60000UL;
+
+      return
+        String(
+          medNames[i]
+        ) +
+        " SNOOZE " +
+        String(
+          minutes
+        ) +
+        "m";
+    }
+
+    int due =
+      medHour[i] *
+      60 +
+      medMinute[i];
+
+    if (
+      now >=
+      due
+    ) {
+      return
+        String(
+          medNames[i]
+        ) +
+        " DUE";
+    }
+  }
+
+  int bestSlot = -1;
+  int bestDifference = 99999;
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    if (
+      medTaken[i] ||
+      medSkipped[i]
+    ) {
+      continue;
+    }
+
+    int due =
+      medHour[i] *
+      60 +
+      medMinute[i];
+
+    int difference =
+      due -
+      now;
+
+    if (
+      difference >=
+      0 &&
+      difference <
+      bestDifference
+    ) {
+      bestDifference =
+        difference;
+
+      bestSlot =
+        i;
+    }
+  }
+
+  if (
+    bestSlot <
+    0
+  ) {
+    return
+      "ALL MEDS DONE";
+  }
+
+  int hours =
+    bestDifference /
+    60;
+
+  int minutes =
+    bestDifference %
+    60;
+
+  String output =
+    String(
+      medNames[
+        bestSlot
+      ]
+    );
+
+  output +=
+    " ";
+
+  if (
+    hours >
+    0
+  ) {
+    output +=
+      String(
+        hours
+      );
+
+    output +=
+      "h ";
+  }
+
+  output +=
+    String(
+      minutes
+    );
+
+  output +=
+    "m";
+
+  return output;
+}
+
+// ================================================================
+// ALARM
+// ================================================================
+
+void startAlarm(
+  int reason
+) {
+  alarmActive =
+    true;
+
+  alarmReason =
+    reason;
+
+  alarmStep =
+    0;
+
+  lastAlarmTone =
+    0;
+
+  currentScreen =
+    SCREEN_ALARM;
+
+  redraw();
+}
+
+void stopAlarm() {
+  alarmActive =
+    false;
+
+  buzzerOff();
+
+  currentScreen =
+    SCREEN_HOME;
+
+  redraw();
+}
+
+void serviceAlarm() {
+  if (
+    !alarmActive
+  ) {
+    return;
+  }
+
+  if (
+    millis() -
+    lastAlarmTone <
+    250
+  ) {
+    return;
+  }
+
+  lastAlarmTone =
+    millis();
+
+  alarmStep++;
+
+  switch (
+    alarmStep %
+    6
+  ) {
+    case 0:
+      buzzerOn(
+        1800
+      );
+      break;
+
+    case 1:
+      buzzerOn(
+        2400
+      );
+      break;
+
+    case 2:
+      buzzerOff();
+      break;
+
+    case 3:
+      buzzerOn(
+        3000
+      );
+      break;
+
+    default:
+      buzzerOff();
+      break;
+  }
+}
+
+// ================================================================
+// MEDICATION SERVICE
+// ================================================================
+
+void serviceMedication() {
+  if (
+    !clockReady ||
+    alarmActive
+  ) {
+    return;
+  }
+
+  int today =
+    todayKey();
+
+  if (
+    today >=
+    0 &&
+    medicationDay !=
+    today
+  ) {
+    resetMedicationDay(
+      today
+    );
+  }
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    if (
+      medTaken[i] ||
+      medSkipped[i]
+    ) {
+      continue;
+    }
+
+    if (
+      medSnoozeUntil[i] !=
+      0 &&
+      millis() >=
+      medSnoozeUntil[i]
+    ) {
+      medSnoozeUntil[i] =
+        0;
+
+      activeMedication =
+        i;
+
+      startAlarm(
+        1
+      );
+
+      return;
+    }
+  }
+
+  struct tm info;
+
+  if (
+    !getLocalTime(
+      &info,
+      5
+    )
+  ) {
+    return;
+  }
+
+  int now =
+    info.tm_hour *
+    60 +
+    info.tm_min;
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    if (
+      medTaken[i] ||
+      medSkipped[i] ||
+      medAlerted[i]
+    ) {
+      continue;
+    }
+
+    int due =
+      medHour[i] *
+      60 +
+      medMinute[i];
+
+    if (
+      now >=
+      due
+    ) {
+      medAlerted[i] =
+        true;
+
+      activeMedication =
+        i;
+
+      saveMedDay();
+
+      startAlarm(
+        1
+      );
+
+      return;
+    }
+  }
+}
+
+// ================================================================
+// TIMER
+// ================================================================
+
+void serviceTimer() {
+  if (
+    !timerRunning
+  ) {
+    return;
+  }
+
+  if (
+    millis() -
+    timerStartedAt >=
+    timerDurationMs
+  ) {
+    timerRunning =
+      false;
+
+    startAlarm(
+      2
+    );
+  }
+}
+
+// ================================================================
+// DISTANCE
+//
+// IMPORTANT FIX:
+// Arduino already defines radians() as a macro.
+// DO NOT use a function called radians().
+// ================================================================
+
+double degreesToRadians(
+  double degrees
+) {
+  return
+    degrees *
+    PI /
+    180.0;
+}
+
+float calculateDistanceKm(
+  double lat1,
+  double lon1,
+  double lat2,
+  double lon2
+) {
+  double dLat =
+    degreesToRadians(
+      lat2 -
+      lat1
+    );
+
+  double dLon =
+    degreesToRadians(
+      lon2 -
+      lon1
+    );
+
+  double a =
+    sin(
+      dLat /
+      2.0
+    ) *
+    sin(
+      dLat /
+      2.0
+    ) +
+
+    cos(
+      degreesToRadians(
+        lat1
+      )
+    ) *
+
+    cos(
+      degreesToRadians(
+        lat2
+      )
+    ) *
+
+    sin(
+      dLon /
+      2.0
+    ) *
+
+    sin(
+      dLon /
+      2.0
+    );
+
+  double c =
+    2.0 *
+    atan2(
+      sqrt(a),
+      sqrt(
+        1.0 -
+        a
+      )
+    );
+
+  return
+    6371.0 *
+    c;
+}
+
+// ================================================================
+// PHARMACY HELPERS
+//
+// NO Pharmacy struct is passed into function arguments.
+// This avoids the .ino auto-prototype issue you hit earlier.
+// ================================================================
+
+bool pharmacyDuplicate(
+  String name,
+  float distance
+) {
+  for (
+    int i = 0;
+    i < pharmacyCount;
+    i++
+  ) {
+    if (
+      pharmacies[i].name ==
+      name &&
+      fabs(
+        pharmacies[i].distanceKm -
+        distance
+      ) <
+      0.05
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void addPharmacy(
+  String name,
+  String address,
+  String phone,
+  String hours,
+  double pLat,
+  double pLon,
+  float distance
+) {
+  if (
+    pharmacyDuplicate(
+      name,
+      distance
+    )
+  ) {
+    return;
+  }
+
+  int insertAt =
+    0;
+
+  while (
+    insertAt <
+    pharmacyCount &&
+    pharmacies[insertAt].distanceKm <=
+    distance
+  ) {
+    insertAt++;
+  }
+
+  if (
+    pharmacyCount <
+    MAX_PHARMACIES
+  ) {
+    pharmacyCount++;
+  } else if (
+    insertAt >=
+    MAX_PHARMACIES
+  ) {
+    return;
+  }
+
+  for (
+    int i =
+      pharmacyCount -
+      1;
+    i >
+      insertAt;
+    i--
+  ) {
+    pharmacies[i] =
+      pharmacies[i - 1];
+  }
+
+  pharmacies[insertAt].name =
+    name;
+
+  pharmacies[insertAt].address =
+    address;
+
+  pharmacies[insertAt].phone =
+    phone;
+
+  pharmacies[insertAt].hours =
+    hours;
+
+  pharmacies[insertAt].lat =
+    pLat;
+
+  pharmacies[insertAt].lon =
+    pLon;
+
+  pharmacies[insertAt].distanceKm =
+    distance;
+}
+
+String buildPharmacyAddress(
+  JsonObject tags
+) {
+  String house =
+    tags["addr:housenumber"] |
+    "";
+
+  String street =
+    tags["addr:street"] |
+    "";
+
+  String city =
+    tags["addr:city"] |
+    "";
+
+  String full =
+    tags["addr:full"] |
+    "";
+
+  String output = "";
+
+  if (
+    house.length()
+  ) {
+    output +=
+      house;
+  }
+
+  if (
+    street.length()
+  ) {
+    if (
+      output.length()
+    ) {
+      output +=
+        " ";
+    }
+
+    output +=
+      street;
+  }
+
+  if (
+    city.length()
+  ) {
+    if (
+      output.length()
+    ) {
+      output +=
+        ", ";
+    }
+
+    output +=
+      city;
+  }
+
+  if (
+    !output.length()
+  ) {
+    output =
+      full;
+  }
+
+  if (
+    !output.length()
+  ) {
+    output =
+      "ADDRESS NOT LISTED";
+  }
+
+  return output;
+}
+
+// ================================================================
+// OPENSTREETMAP OVERPASS
+// ================================================================
+
+bool searchPharmacies() {
+  pharmacyCount =
+    0;
+
+  pharmacySelection =
+    0;
+
+  pharmacySearchDone =
+    false;
+
+  if (
+    !WiFi.isConnected()
+  ) {
+    pharmacyMessage =
+      "WIFI OFFLINE";
+
+    pharmacySearchDone =
+      true;
+
+    redraw();
+
+    return false;
+  }
+
+  if (
+    !locationReady
+  ) {
+    if (
+      !loadLocation()
+    ) {
+      if (
+        !fetchIPLocation()
+      ) {
+        pharmacyMessage =
+          "NO LOCATION";
+
+        pharmacySearchDone =
+          true;
+
+        redraw();
+
+        return false;
+      }
+    }
+  }
+
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "PHARMACY",
+    55,
+    3,
+    C_HEADER
+  );
+
+  centeredText(
+    "SEARCHING...",
+    110,
+    3,
+    C_YELLOW
+  );
+
+  centeredText(
+    "OPENSTREETMAP",
+    160,
+    1,
+    C_GREY
+  );
+
+  String query =
+    "[out:json][timeout:15];(";
+
+  query +=
+    "node[\"amenity\"=\"pharmacy\"](around:5000,";
+
+  query +=
+    String(
+      latitude,
+      6
+    );
+
+  query +=
+    ",";
+
+  query +=
+    String(
+      longitude,
+      6
+    );
+
+  query +=
+    ");";
+
+  query +=
+    "way[\"amenity\"=\"pharmacy\"](around:5000,";
+
+  query +=
+    String(
+      latitude,
+      6
+    );
+
+  query +=
+    ",";
+
+  query +=
+    String(
+      longitude,
+      6
+    );
+
+  query +=
+    ");";
+
+  query +=
+    "relation[\"amenity\"=\"pharmacy\"](around:5000,";
+
+  query +=
+    String(
+      latitude,
+      6
+    );
+
+  query +=
+    ",";
+
+  query +=
+    String(
+      longitude,
+      6
+    );
+
+  query +=
+    ");";
+
+  query +=
+    ");out center 40;";
+
+  String url =
+    "https://overpass-api.de/api/interpreter?data=";
+
+  url +=
+    urlEncode(
+      query
+    );
+
+  Serial.println();
+
+  Serial.println(
+    "OVERPASS REQUEST"
+  );
+
+  WiFiClientSecure client;
+
+  client.setInsecure();
+
+  HTTPClient http;
+
+  if (
+    !http.begin(
+      client,
+      url
+    )
+  ) {
+    pharmacyMessage =
+      "HTTP ERROR";
+
+    pharmacySearchDone =
+      true;
+
+    redraw();
+
+    return false;
+  }
+
+  http.setTimeout(
+    20000
+  );
+
+  http.setFollowRedirects(
+    HTTPC_FORCE_FOLLOW_REDIRECTS
+  );
+
+  http.addHeader(
+    "User-Agent",
+    "MedKit-XIAO-V47"
+  );
+
+  int code =
+    http.GET();
+
+  Serial.print(
+    "Overpass HTTP: "
+  );
+
+  Serial.println(
+    code
+  );
+
+  if (
+    code !=
+    HTTP_CODE_OK
+  ) {
+    if (
+      code <
+      0
+    ) {
+      Serial.print(
+        "OVERPASS NETWORK ERROR: "
+      );
+
+      Serial.println(
+        HTTPClient::errorToString(
+          code
+        )
+      );
+    }
+
+    http.end();
+
+    pharmacyMessage =
+      "API ERROR";
+
+    pharmacySearchDone =
+      true;
+
+    errorBeep();
+
+    redraw();
+
+    return false;
+  }
+
+  String payload =
+    http.getString();
+
+  http.end();
+
+  Serial.print(
+    "Overpass bytes: "
+  );
+
+  Serial.println(
+    payload.length()
+  );
+
+  JsonDocument doc;
+
+  DeserializationError error =
+    deserializeJson(
+      doc,
+      payload
+    );
+
+  if (
+    error
+  ) {
+    Serial.print(
+      "OVERPASS JSON ERROR: "
+    );
+
+    Serial.println(
+      error.c_str()
+    );
+
+    pharmacyMessage =
+      "DATA ERROR";
+
+    pharmacySearchDone =
+      true;
+
+    errorBeep();
+
+    redraw();
+
+    return false;
+  }
+
+  JsonArray elements =
+    doc["elements"]
+      .as<JsonArray>();
+
+  Serial.print(
+    "OSM elements: "
+  );
+
+  Serial.println(
+    elements.size()
+  );
+
+  for (
+    JsonObject element :
+    elements
+  ) {
+    double pLat = 0;
+    double pLon = 0;
+
+    String type =
+      element["type"] |
+      "";
+
+    if (
+      type ==
+      "node"
+    ) {
+      pLat =
+        element["lat"] |
+        0.0;
+
+      pLon =
+        element["lon"] |
+        0.0;
+    } else {
+      pLat =
+        element["center"]["lat"] |
+        0.0;
+
+      pLon =
+        element["center"]["lon"] |
+        0.0;
+    }
+
+    if (
+      pLat ==
+      0 &&
+      pLon ==
+      0
+    ) {
+      continue;
+    }
+
+    JsonObject tags =
+      element["tags"]
+        .as<JsonObject>();
+
+    String name =
+      tags["name"] |
+      "";
+
+    if (
+      !name.length()
+    ) {
+      name =
+        tags["brand"] |
+        "";
+    }
+
+    if (
+      !name.length()
+    ) {
+      name =
+        tags["operator"] |
+        "";
+    }
+
+    if (
+      !name.length()
+    ) {
+      name =
+        "PHARMACY";
+    }
+
+    String phone =
+      tags["phone"] |
+      "";
+
+    if (
+      !phone.length()
+    ) {
+      phone =
+        tags["contact:phone"] |
+        "";
+    }
+
+    String hours =
+      tags["opening_hours"] |
+      "";
+
+    String address =
+      buildPharmacyAddress(
+        tags
+      );
+
+    float distance =
+      calculateDistanceKm(
+        latitude,
+        longitude,
+        pLat,
+        pLon
+      );
+
+    addPharmacy(
+      name,
+      address,
+      phone,
+      hours,
+      pLat,
+      pLon,
+      distance
+    );
+  }
+
+  pharmacySearchDone =
+    true;
+
+  if (
+    pharmacyCount ==
+    0
+  ) {
+    pharmacyMessage =
+      "NONE FOUND";
+
+    errorBeep();
+
+    redraw();
+
+    return false;
+  }
+
+  pharmacyMessage =
+    "FOUND";
+
+  Serial.print(
+    "PHARMACIES LOADED: "
+  );
+
+  Serial.println(
+    pharmacyCount
+  );
+
+  for (
+    int i = 0;
+    i < pharmacyCount;
+    i++
+  ) {
+    Serial.print(
+      i +
+      1
+    );
+
+    Serial.print(
+      ". "
+    );
+
+    Serial.print(
+      pharmacies[i].name
+    );
+
+    Serial.print(
+      " | "
+    );
+
+    Serial.print(
+      pharmacies[i].distanceKm,
+      2
+    );
+
+    Serial.println(
+      " km"
+    );
+  }
+
+  successBeep();
+
+  redraw();
+
+  return true;
+}
+
+// ================================================================
+// QR CODE
+// ================================================================
+
+String cleanPhone(
+  String phone
+) {
+  String output = "";
+
+  for (
+    unsigned int i = 0;
+    i < phone.length();
+    i++
+  ) {
+    char c =
+      phone[i];
+
+    if (
+      c >= '0' &&
+      c <= '9'
+    ) {
+      output += c;
+    } else if (
+      c ==
+      '+' &&
+      output.length() ==
+      0
+    ) {
+      output += c;
+    }
+  }
+
+  return output;
+}
+
+static void qrDisplayCallback(
+  esp_qrcode_handle_t qrcode
+) {
+  int qrSize =
+    esp_qrcode_get_size(
+      qrcode
+    );
+
+  const int quiet =
+    4;
+
+  int totalModules =
+    qrSize +
+    quiet *
+    2;
+
+  int scale =
+    190 /
+    totalModules;
+
+  if (
+    scale <
+    1
+  ) {
+    scale = 1;
+  }
+
+  int pixels =
+    totalModules *
+    scale;
+
+  int startX =
+    (
+      240 -
+      pixels
+    ) /
+    2;
+
+  int startY =
+    12;
+
+  tft.fillRect(
+    startX,
+    startY,
+    pixels,
+    pixels,
+    ST77XX_WHITE
+  );
+
+  for (
+    int y = 0;
+    y < qrSize;
+    y++
+  ) {
+    for (
+      int x = 0;
+      x < qrSize;
+      x++
+    ) {
+      if (
+        esp_qrcode_get_module(
+          qrcode,
+          x,
+          y
+        )
+      ) {
+        tft.fillRect(
+          startX +
+          (
+            x +
+            quiet
+          ) *
+          scale,
+
+          startY +
+          (
+            y +
+            quiet
+          ) *
+          scale,
+
+          scale,
+          scale,
+
+          ST77XX_BLACK
+        );
+      }
+    }
+  }
+}
+
+bool generateQR(
+  String payload
+) {
+  esp_qrcode_config_t config =
+    ESP_QRCODE_CONFIG_DEFAULT();
+
+  config.display_func =
+    qrDisplayCallback;
+
+  esp_err_t result =
+    esp_qrcode_generate(
+      &config,
+      payload.c_str()
+    );
+
+  return
+    result ==
+    ESP_OK;
+}
+
+void showQR(
+  String payload,
+  String footer,
+  int returnScreen
+) {
+  qrPayload =
+    payload;
+
+  qrFooter =
+    footer;
+
+  qrReturnScreen =
+    returnScreen;
+
+  currentScreen =
+    SCREEN_QR;
+
+  redraw();
+}
+
+// ================================================================
+// EMERGENCY PROFILE
+// ================================================================
+
+void loadEmergency() {
+  cardName =
+    prefs.getString(
+      "cardname",
+      "SET NAME"
+    );
+
+  cardContact =
+    prefs.getString(
+      "cardcontact",
+      "SET CONTACT"
+    );
+
+  cardAllergies =
+    prefs.getString(
+      "allergies",
+      "SET ALLERGIES"
+    );
+
+  cardMeds =
+    prefs.getString(
+      "cardmeds",
+      "SET MEDS"
+    );
+
+  emergencyPhone =
+    prefs.getString(
+      "icephone",
+      ""
+    );
+}
+
+String emergencyQRText() {
+  String output =
+    "MEDKIT EMERGENCY CARD\n";
+
+  output +=
+    "Name: " +
+    cardName +
+    "\n";
+
+  output +=
+    "Contact: " +
+    cardContact +
+    "\n";
+
+  output +=
+    "Allergies: " +
+    cardAllergies +
+    "\n";
+
+  output +=
+    "Meds: " +
+    cardMeds;
+
+  if (
+    emergencyPhone.length()
+  ) {
+    output +=
+      "\nICE: ";
+
+    output +=
+      emergencyPhone;
+  }
+
+  return output;
+}
+
+// ================================================================
+// HOME SCREEN
+// ================================================================
+
+void drawHome() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "MEDKIT",
+    40,
+    3,
+    C_HEADER
+  );
+
+  drawCard(
+    8,
+    75,
+    224,
+    65
+  );
+
+  if (
+    weatherReady
+  ) {
+    tft.setTextSize(
+      2
+    );
+
+    tft.setTextColor(
+      C_GREEN
+    );
+
+    tft.setCursor(
+      17,
+      86
+    );
+
+    tft.print(
+      shortenText(
+        locationName,
+        15
+      )
+    );
+
+    tft.setTextColor(
+      C_TEXT
+    );
+
+    tft.setCursor(
+      17,
+      112
+    );
+
+    tft.print(
+      temperatureC,
+      1
+    );
+
+    tft.print(
+      " C "
+    );
+
+    tft.setTextColor(
+      C_YELLOW
+    );
+
+    tft.print(
+      shortenText(
+        weatherText,
+        12
+      )
+    );
+  } else {
+    centeredText(
+      WiFi.isConnected()
+        ?
+        "GETTING WEATHER..."
+        :
+        "WIFI OFFLINE",
+      100,
+      2,
+      WiFi.isConnected()
+        ?
+        C_YELLOW
+        :
+        C_RED
+    );
+  }
+
+  drawCard(
+    8,
+    150,
+    224,
+    50
+  );
+
+  tft.setTextSize(
+    1
+  );
+
+  tft.setTextColor(
+    C_GREY
+  );
+
+  tft.setCursor(
+    17,
+    159
+  );
+
+  tft.print(
+    "NEXT MEDICATION"
+  );
+
+  centeredText(
+    shortenText(
+      nextMedication(),
+      19
+    ),
+    175,
+    2,
+    C_GREEN
+  );
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    if (
+      medStock[i] >=
+      0 &&
+      medStock[i] <=
+      medLow[i]
+    ) {
+      centeredText(
+        String(
+          "REFILL "
+        ) +
+        medNames[i] +
+        ": " +
+        String(
+          medStock[i]
+        ),
+        207,
+        1,
+        C_RED
+      );
+
+      break;
+    }
+  }
+
+  centeredText(
+    "CONFIRM = MENU",
+    227,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// MAIN MENU
+// ================================================================
+
+void drawMenu() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "MEDKIT MENU",
+    40,
+    2,
+    C_HEADER
+  );
+
+  int first =
+    menuSelection -
+    2;
+
+  if (
+    first <
+    0
+  ) {
+    first = 0;
+  }
+
+  if (
+    first >
+    MENU_COUNT -
+    5
+  ) {
+    first =
+      MENU_COUNT -
+      5;
+  }
+
+  for (
+    int row = 0;
+    row < 5;
+    row++
+  ) {
+    int index =
+      first +
+      row;
+
+    if (
+      index >=
+      MENU_COUNT
+    ) {
+      break;
+    }
+
+    menuRow(
+      67 +
+      row *
+      33,
+      menuItems[index],
+      index ==
+      menuSelection
+    );
+  }
+}
+
+// ================================================================
+// WEATHER SCREEN
+// ================================================================
+
+void drawWeatherScreen() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "WEATHER",
+    42,
+    3,
+    C_HEADER
+  );
+
+  if (
+    !weatherReady
+  ) {
+    centeredText(
+      WiFi.isConnected()
+        ?
+        "NO WEATHER DATA"
+        :
+        "WIFI OFFLINE",
+      105,
+      2,
+      C_RED
+    );
+
+    centeredText(
+      "CONFIRM REFRESH",
+      150,
+      2,
+      C_YELLOW
+    );
+
+    centeredText(
+      "CLEAR BACK",
+      220,
+      1,
+      C_GREY
+    );
+
+    return;
+  }
+
+  centeredText(
+    weatherText,
+    78,
+    2,
+    C_YELLOW
+  );
+
+  drawCard(
+    10,
+    108,
+    220,
+    104
+  );
+
+  tft.setTextSize(
+    2
+  );
+
+  tft.setTextColor(
+    C_TEXT
+  );
+
+  tft.setCursor(
+    20,
+    120
+  );
+
+  tft.print(
+    "TEMP "
+  );
+
+  tft.print(
+    temperatureC,
+    1
+  );
+
+  tft.print(
+    " C"
+  );
+
+  tft.setCursor(
+    20,
+    145
+  );
+
+  tft.print(
+    "FEELS "
+  );
+
+  tft.print(
+    feelsLikeC,
+    1
+  );
+
+  tft.print(
+    " C"
+  );
+
+  tft.setCursor(
+    20,
+    170
+  );
+
+  tft.print(
+    "HUM "
+  );
+
+  tft.print(
+    humidityPercent,
+    0
+  );
+
+  tft.print(
+    "%"
+  );
+
+  tft.setCursor(
+    20,
+    195
+  );
+
+  tft.print(
+    "WIND "
+  );
+
+  tft.print(
+    windKmh,
+    0
+  );
+
+  tft.print(
+    " km/h"
+  );
+
+  centeredText(
+    "CONFIRM REFRESH | CLEAR BACK",
+    226,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// MED MENU
+// ================================================================
+
+void drawMedMenu() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "MED SCHEDULE",
+    40,
+    2,
+    C_HEADER
+  );
+
+  for (
+    int i = 0;
+    i < 5;
+    i++
+  ) {
+    String label;
+
+    if (
+      i <
+      3
+    ) {
+      label =
+        String(
+          medNames[i]
+        ) +
+        " " +
+        formatMedTime(
+          medHour[i],
+          medMinute[i]
+        );
+    } else if (
+      i ==
+      3
+    ) {
+      label =
+        "TODAY STATUS";
+    } else {
+      label =
+        "MED STOCK";
+    }
+
+    menuRow(
+      67 +
+      i *
+      33,
+      label,
+      i ==
+      medMenuSelection
+    );
+  }
+}
+
+// ================================================================
+// MED EDIT
+// ================================================================
+
+void drawMedEdit() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    String(
+      "EDIT "
+    ) +
+    medNames[
+      editMedSlot
+    ],
+    44,
+    2,
+    C_HEADER
+  );
+
+  drawCard(
+    20,
+    85,
+    200,
+    70
+  );
+
+  centeredText(
+    formatMedTime(
+      editHour,
+      editMinute
+    ),
+    105,
+    4,
+    C_GREEN
+  );
+
+  centeredText(
+    editMedField ==
+    0
+      ?
+      "EDIT HOUR"
+      :
+      "EDIT MINUTES",
+    174,
+    2,
+    C_YELLOW
+  );
+
+  centeredText(
+    editMedField ==
+    0
+      ?
+      "UP/DOWN | CONFIRM NEXT"
+      :
+      "UP/DOWN | CONFIRM SAVE",
+    205,
+    1
+  );
+
+  centeredText(
+    "CLEAR CANCEL",
+    227,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// MED STATUS
+// ================================================================
+
+void drawMedStatus() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "TODAY'S MEDS",
+    42,
+    2,
+    C_HEADER
+  );
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    int y =
+      76 +
+      i *
+      48;
+
+    if (
+      i ==
+      medStatusSelection
+    ) {
+      tft.drawRoundRect(
+        8,
+        y,
+        224,
+        39,
+        6,
+        C_HEADER
+      );
+    }
+
+    String status =
+      medStatus(
+        i
+      );
+
+    uint16_t color =
+      C_GREY;
+
+    if (
+      status ==
+      "TAKEN"
+    ) color = C_GREEN;
+
+    if (
+      status ==
+      "DUE"
+    ) color = C_RED;
+
+    if (
+      status ==
+      "SNOOZE"
+    ) color = C_YELLOW;
+
+    if (
+      status ==
+      "SKIP"
+    ) color = C_MAGENTA;
+
+    tft.setTextSize(
+      2
+    );
+
+    tft.setTextColor(
+      C_TEXT
+    );
+
+    tft.setCursor(
+      17,
+      y + 10
+    );
+
+    tft.print(
+      medNames[i]
+    );
+
+    tft.setTextColor(
+      color
+    );
+
+    tft.setCursor(
+      145,
+      y + 10
+    );
+
+    tft.print(
+      status
+    );
+  }
+
+  centeredText(
+    "CONFIRM TOGGLE | CLEAR BACK",
+    226,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// MED STOCK
+// ================================================================
+
+void drawMedStock() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "MED STOCK",
+    42,
+    3,
+    C_HEADER
+  );
+
+  for (
+    int i = 0;
+    i < MED_COUNT;
+    i++
+  ) {
+    int y =
+      78 +
+      i *
+      46;
+
+    if (
+      i ==
+      medStockSelection
+    ) {
+      tft.drawRoundRect(
+        8,
+        y,
+        224,
+        38,
+        6,
+        C_HEADER
+      );
+    }
+
+    tft.setTextSize(
+      2
+    );
+
+    tft.setTextColor(
+      C_TEXT
+    );
+
+    tft.setCursor(
+      17,
+      y + 9
+    );
+
+    tft.print(
+      medNames[i]
+    );
+
+    tft.setCursor(
+      170,
+      y + 9
+    );
+
+    if (
+      medStock[i] <
+      0
+    ) {
+      tft.print(
+        "--"
+      );
+    } else {
+      tft.print(
+        medStock[i]
+      );
+    }
+  }
+
+  centeredText(
+    "CONFIRM +1 | CLEAR BACK",
+    226,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// TIMER
+// ================================================================
+
+void drawTimerSelect() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "GENERAL TIMER",
+    48,
+    2,
+    C_HEADER
+  );
+
+  drawCard(
+    15,
+    90,
+    210,
+    70
+  );
+
+  centeredText(
+    timerPresetNames[
+      timerSelection
+    ],
+    111,
+    3,
+    C_GREEN
+  );
+
+  centeredText(
+    "UP / DOWN",
+    178,
+    2
+  );
+
+  centeredText(
+    "CONFIRM START",
+    205,
+    2,
+    C_YELLOW
+  );
+}
+
+void updateTimerArea() {
+  if (
+    !timerRunning
+  ) {
+    return;
+  }
+
+  unsigned long elapsed =
+    (
+      millis() -
+      timerStartedAt
+    ) /
+    1000UL;
+
+  unsigned long total =
+    timerDurationMs /
+    1000UL;
+
+  unsigned long remaining =
+    elapsed <
+    total
+      ?
+      total -
+      elapsed
+      :
+      0;
+
+  tft.fillRect(
+    10,
+    75,
+    220,
+    125,
+    C_BG
+  );
+
+  drawCard(
+    15,
+    80,
+    210,
+    90
+  );
+
+  char buffer[20];
+
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%02lu:%02lu",
+    remaining /
+    60UL,
+    remaining %
+    60UL
+  );
+
+  centeredText(
+    buffer,
+    105,
+    5,
+    C_GREEN
+  );
+
+  float progress =
+    0;
+
+  if (
+    total >
+    0
+  ) {
+    progress =
+      (
+        float
+      )remaining /
+      (
+        float
+      )total;
+  }
+
+  int width =
+    188 *
+    progress;
+
+  tft.drawRect(
+    25,
+    181,
+    190,
+    12,
+    C_GREY
+  );
+
+  tft.fillRect(
+    26,
+    182,
+    width,
+    10,
+    C_GREEN
+  );
+}
+
+void drawTimerRunning() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "TIMER",
+    43,
+    3,
+    C_HEADER
+  );
+
+  updateTimerArea();
+
+  centeredText(
+    "CLEAR = CANCEL",
+    218,
+    2,
+    C_RED
+  );
+}
+
+// ================================================================
+// KIT
+// ================================================================
+
+void drawKit() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "KIT CHECK",
+    42,
+    2,
+    C_HEADER
+  );
+
+  int first =
+    kitSelection -
+    2;
+
+  if (
+    first <
+    0
+  ) {
+    first = 0;
+  }
+
+  if (
+    first >
+    KIT_COUNT -
+    5
+  ) {
+    first =
+      KIT_COUNT -
+      5;
+  }
+
+  for (
+    int row = 0;
+    row < 5;
+    row++
+  ) {
+    int index =
+      first +
+      row;
+
+    if (
+      index >=
+      KIT_COUNT
+    ) {
+      break;
+    }
+
+    String label =
+      kitChecked[index]
+        ?
+        "[X] "
+        :
+        "[ ] ";
+
+    label +=
+      kitItems[index];
+
+    menuRow(
+      67 +
+      row *
+      33,
+      label,
+      index ==
+      kitSelection
+    );
+  }
+}
+
+// ================================================================
+// PHARMACY LIST
+// ================================================================
+
+void drawPharmacyList() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "NEARBY PHARMACY",
+    40,
+    2,
+    C_GREEN
+  );
+
+  if (
+    !pharmacySearchDone
+  ) {
+    centeredText(
+      "OPENSTREETMAP",
+      92,
+      2,
+      C_HEADER
+    );
+
+    centeredText(
+      locationReady
+        ?
+        shortenText(
+          locationName,
+          18
+        )
+        :
+        "LOCATION NEEDED",
+      128,
+      2,
+      locationReady
+        ?
+        C_TEXT
+        :
+        C_RED
+    );
+
+    centeredText(
+      "CONFIRM SEARCH",
+      178,
+      2,
+      C_YELLOW
+    );
+
+    centeredText(
+      "CLEAR BACK",
+      220,
+      1,
+      C_GREY
+    );
+
+    return;
+  }
+
+  if (
+    pharmacyCount ==
+    0
+  ) {
+    centeredText(
+      pharmacyMessage,
+      105,
+      2,
+      C_RED
+    );
+
+    centeredText(
+      "CONFIRM RETRY",
+      150,
+      2,
+      C_YELLOW
+    );
+
+    centeredText(
+      "CLEAR BACK",
+      220,
+      1,
+      C_GREY
+    );
+
+    return;
+  }
+
+  int first =
+    pharmacySelection -
+    2;
+
+  if (
+    first <
+    0
+  ) {
+    first = 0;
+  }
+
+  if (
+    first >
+    pharmacyCount -
+    4
+  ) {
+    first =
+      pharmacyCount -
+      4;
+  }
+
+  if (
+    first <
+    0
+  ) {
+    first = 0;
+  }
+
+  for (
+    int row = 0;
+    row < 4;
+    row++
+  ) {
+    int index =
+      first +
+      row;
+
+    if (
+      index >=
+      pharmacyCount
+    ) {
+      break;
+    }
+
+    String label =
+      shortenText(
+        pharmacies[index].name,
+        13
+      );
+
+    label +=
+      " ";
+
+    label +=
+      String(
+        pharmacies[index].distanceKm,
+        1
+      );
+
+    label +=
+      "km";
+
+    menuRow(
+      70 +
+      row *
+      38,
+      label,
+      index ==
+      pharmacySelection
+    );
+  }
+
+  centeredText(
+    "CONFIRM DETAILS",
+    225,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// PHARMACY DETAILS
+// ================================================================
+
+void drawPharmacyDetails() {
+  clearDisplay();
+
+  drawTopBar();
+
+  int i =
+    pharmacySelection;
+
+  centeredText(
+    shortenText(
+      pharmacies[i].name,
+      19
+    ),
+    41,
+    2,
+    C_GREEN
+  );
+
+  centeredText(
+    String(
+      pharmacies[i].distanceKm,
+      2
+    ) +
+    " km",
+    68,
+    2,
+    C_HEADER
+  );
+
+  tft.setTextSize(
+    1
+  );
+
+  tft.setTextColor(
+    C_GREY
+  );
+
+  tft.setCursor(
+    10,
+    98
+  );
+
+  tft.print(
+    "ADDRESS"
+  );
+
+  wrappedText(
+    pharmacies[i].address,
+    10,
+    111,
+    35,
+    11,
+    3
+  );
+
+  tft.setTextColor(
+    C_GREY
+  );
+
+  tft.setCursor(
+    10,
+    151
+  );
+
+  tft.print(
+    "PHONE"
+  );
+
+  tft.setTextSize(
+    2
+  );
+
+  if (
+    pharmacies[i].phone.length()
+  ) {
+    tft.setTextColor(
+      C_YELLOW
+    );
+
+    tft.setCursor(
+      10,
+      166
+    );
+
+    tft.print(
+      shortenText(
+        pharmacies[i].phone,
+        18
+      )
+    );
+
+    centeredText(
+      "CONFIRM CALL QR",
+      202,
+      1,
+      C_GREEN
+    );
+  } else {
+    tft.setTextColor(
+      C_RED
+    );
+
+    tft.setCursor(
+      10,
+      166
+    );
+
+    tft.print(
+      "NOT LISTED"
+    );
+
+    centeredText(
+      "NO PHONE IN OSM",
+      202,
+      1,
+      C_RED
+    );
+  }
+
+  centeredText(
+    "UP DIRECTIONS QR",
+    216,
+    1,
+    C_HEADER
+  );
+
+  centeredText(
+    "CLEAR BACK",
+    229,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// EMERGENCY SCREEN
+// ================================================================
+
+void drawEmergencyScreen() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "EMERGENCY",
+    40,
+    3,
+    C_RED
+  );
+
+  tft.setTextSize(
+    1
+  );
+
+  tft.setTextColor(
+    C_GREY
+  );
+
+  tft.setCursor(
+    10,
+    78
+  );
+
+  tft.print(
+    "NAME"
+  );
+
+  tft.setTextSize(
+    2
+  );
+
+  tft.setTextColor(
+    C_TEXT
+  );
+
+  tft.setCursor(
+    10,
+    92
+  );
+
+  tft.print(
+    shortenText(
+      cardName,
+      18
+    )
+  );
+
+  tft.setTextSize(
+    1
+  );
+
+  tft.setTextColor(
+    C_GREY
+  );
+
+  tft.setCursor(
+    10,
+    125
+  );
+
+  tft.print(
+    "CONTACT"
+  );
+
+  tft.setTextSize(
+    2
+  );
+
+  tft.setTextColor(
+    C_TEXT
+  );
+
+  tft.setCursor(
+    10,
+    139
+  );
+
+  tft.print(
+    shortenText(
+      cardContact,
+      18
+    )
+  );
+
+  tft.setTextSize(
+    1
+  );
+
+  tft.setTextColor(
+    C_GREY
+  );
+
+  tft.setCursor(
+    10,
+    171
+  );
+
+  tft.print(
+    "ICE PHONE"
+  );
+
+  tft.setTextSize(
+    2
+  );
+
+  tft.setTextColor(
+    C_YELLOW
+  );
+
+  tft.setCursor(
+    10,
+    185
+  );
+
+  tft.print(
+    emergencyPhone.length()
+      ?
+      shortenText(
+        emergencyPhone,
+        18
+      )
+      :
+      "NOT SET"
+  );
+
+  centeredText(
+    "UP = CARD QR",
+    218,
+    1,
+    C_GREEN
+  );
+
+  centeredText(
+    "CLEAR BACK",
+    230,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// FIRST AID
+// ================================================================
+
+void drawAidMenu() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "FIRST AID",
+    42,
+    3,
+    C_RED
+  );
+
+  for (
+    int i = 0;
+    i < AID_COUNT;
+    i++
+  ) {
+    menuRow(
+      82 +
+      i *
+      37,
+      aidTitles[i],
+      i ==
+      aidSelection
+    );
+  }
+}
+
+void drawAidView() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    aidTitles[
+      aidSelection
+    ],
+    42,
+    3,
+    C_RED
+  );
+
+  tft.setTextSize(
+    2
+  );
+
+  tft.setTextColor(
+    C_TEXT
+  );
+
+  if (
+    aidSelection ==
+    0
+  ) {
+    tft.setCursor(
+      12,
+      90
+    );
+
+    tft.print(
+      "1. Apply pressure"
+    );
+
+    tft.setCursor(
+      12,
+      122
+    );
+
+    tft.print(
+      "2. Rinse with water"
+    );
+
+    tft.setCursor(
+      12,
+      154
+    );
+
+    tft.print(
+      "3. Cover wound"
+    );
+
+    tft.setCursor(
+      12,
+      186
+    );
+
+    tft.print(
+      "Deep? Get help"
+    );
+  } else if (
+    aidSelection ==
+    1
+  ) {
+    tft.setCursor(
+      12,
+      90
+    );
+
+    tft.print(
+      "1. Cool water"
+    );
+
+    tft.setCursor(
+      12,
+      122
+    );
+
+    tft.print(
+      "2. No direct ice"
+    );
+
+    tft.setCursor(
+      12,
+      154
+    );
+
+    tft.print(
+      "3. Cover loosely"
+    );
+
+    tft.setCursor(
+      12,
+      186
+    );
+
+    tft.print(
+      "Large? Get help"
+    );
+  } else if (
+    aidSelection ==
+    2
+  ) {
+    tft.setCursor(
+      12,
+      90
+    );
+
+    tft.print(
+      "1. Lean forward"
+    );
+
+    tft.setCursor(
+      12,
+      122
+    );
+
+    tft.print(
+      "2. Pinch soft nose"
+    );
+
+    tft.setCursor(
+      12,
+      154
+    );
+
+    tft.print(
+      "3. Hold 10-15 min"
+    );
+
+    tft.setCursor(
+      12,
+      186
+    );
+
+    tft.print(
+      "Don't tilt back"
+    );
+  } else {
+    tft.setCursor(
+      12,
+      90
+    );
+
+    tft.print(
+      "1. Rest"
+    );
+
+    tft.setCursor(
+      12,
+      122
+    );
+
+    tft.print(
+      "2. Cold pack"
+    );
+
+    tft.setCursor(
+      12,
+      154
+    );
+
+    tft.print(
+      "3. Elevate"
+    );
+
+    tft.setCursor(
+      12,
+      186
+    );
+
+    tft.print(
+      "Severe? Get help"
+    );
+  }
+
+  centeredText(
+    "CLEAR BACK",
+    225,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// LOCATION SCREEN
+// ================================================================
+
+void drawLocationScreen() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "LOCATION",
+    42,
+    3,
+    C_HEADER
+  );
+
+  if (
+    !locationReady
+  ) {
+    centeredText(
+      "NO LOCATION",
+      105,
+      2,
+      C_RED
+    );
+
+    centeredText(
+      "CONFIRM RETRY",
+      150,
+      2,
+      C_YELLOW
+    );
+
+    return;
+  }
+
+  centeredText(
+    shortenText(
+      locationName,
+      18
+    ),
+    90,
+    3,
+    C_GREEN
+  );
+
+  centeredText(
+    shortenText(
+      regionName,
+      20
+    ),
+    130,
+    2
+  );
+
+  centeredText(
+    shortenText(
+      countryName,
+      20
+    ),
+    158,
+    2
+  );
+
+  tft.setTextSize(
+    1
+  );
+
+  tft.setTextColor(
+    C_GREY
+  );
+
+  tft.setCursor(
+    15,
+    190
+  );
+
+  tft.print(
+    latitude,
+    5
+  );
+
+  tft.print(
+    ", "
+  );
+
+  tft.print(
+    longitude,
+    5
+  );
+
+  centeredText(
+    manualLocation
+      ?
+      "SOURCE SAVED"
+      :
+      "SOURCE IP APPROX",
+    208,
+    1,
+    C_GREY
+  );
+
+  centeredText(
+    "CONFIRM REFRESH",
+    226,
+    1,
+    C_HEADER
+  );
+}
+
+// ================================================================
+// ALERT TEST
+// ================================================================
+
+void drawAlertTest() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "ALERT TEST",
+    65,
+    3,
+    C_RED
+  );
+
+  centeredText(
+    "CONFIRM",
+    125,
+    3,
+    C_YELLOW
+  );
+
+  centeredText(
+    "START ALARM",
+    165,
+    2
+  );
+
+  centeredText(
+    "CLEAR BACK",
+    215,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// DEVICE
+// ================================================================
+
+void drawDevice() {
+  clearDisplay();
+
+  drawTopBar();
+
+  centeredText(
+    "DEVICE",
+    42,
+    3,
+    C_HEADER
+  );
+
+  tft.setTextSize(
+    2
+  );
+
+  tft.setTextColor(
+    C_TEXT
+  );
+
+  tft.setCursor(
+    15,
+    80
+  );
+
+  tft.print(
+    "WIFI: "
+  );
+
+  tft.setTextColor(
+    WiFi.isConnected()
+      ?
+      C_GREEN
+      :
+      C_RED
+  );
+
+  tft.print(
+    WiFi.isConnected()
+      ?
+      "ONLINE"
+      :
+      "OFFLINE"
+  );
+
+  tft.setTextColor(
+    C_TEXT
+  );
+
+  tft.setCursor(
+    15,
+    112
+  );
+
+  tft.print(
+    "API: "
+  );
+
+  tft.setTextColor(
+    weatherReady
+      ?
+      C_GREEN
+      :
+      C_YELLOW
+  );
+
+  tft.print(
+    weatherReady
+      ?
+      "READY"
+      :
+      "WAIT"
+  );
+
+  tft.setTextColor(
+    C_TEXT
+  );
+
+  tft.setCursor(
+    15,
+    144
+  );
+
+  tft.print(
+    "SIGNAL: "
+  );
+
+  if (
+    WiFi.isConnected()
+  ) {
+    tft.print(
+      WiFi.RSSI()
+    );
+
+    tft.print(
+      " dBm"
+    );
+  } else {
+    tft.print(
+      "--"
+    );
+  }
+
+  centeredText(
+    "CONFIRM = RECONNECT",
+    185,
+    1,
+    C_YELLOW
+  );
+
+  centeredText(
+    lightTheme
+      ?
+      "UP = DARK THEME"
+      :
+      "UP = LIGHT THEME",
+    205,
+    1,
+    C_HEADER
+  );
+
+  centeredText(
+    "CLEAR BACK",
+    226,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// QR SCREEN
+// ================================================================
+
+void drawQRScreen() {
+  clearDisplay();
+
+  bool ok =
+    generateQR(
+      qrPayload
+    );
+
+  if (
+    !ok
+  ) {
+    centeredText(
+      "QR ERROR",
+      100,
+      3,
+      C_RED
+    );
+  } else {
+    centeredText(
+      shortenText(
+        qrFooter,
+        24
+      ),
+      218,
+      1,
+      C_GREEN
+    );
+  }
+
+  centeredText(
+    "CLEAR BACK",
+    230,
+    1,
+    C_GREY
+  );
+}
+
+// ================================================================
+// ALARM SCREEN
+// ================================================================
+
+void drawAlarmScreen() {
+  clearDisplay();
+
+  tft.drawRoundRect(
+    8,
+    38,
+    224,
+    190,
+    10,
+    C_RED
+  );
+
+  if (
+    alarmReason ==
+    1
+  ) {
+    centeredText(
+      "MED ALERT",
+      55,
+      3,
+      C_RED
+    );
+
+    if (
+      activeMedication >=
+      0
+    ) {
+      centeredText(
+        medNames[
+          activeMedication
+        ],
+        105,
+        4,
+        C_YELLOW
+      );
+    }
+
+    centeredText(
+      "CONFIRM = TAKEN",
+      158,
+      2,
+      C_GREEN
+    );
+
+    centeredText(
+      "UP = SNOOZE 10",
+      184,
+      1,
+      C_YELLOW
+    );
+
+    centeredText(
+      "DOWN = SKIP TODAY",
+      199,
+      1,
+      C_MAGENTA
+    );
+
+    centeredText(
+      "CLEAR = DISMISS",
+      214,
+      1,
+      C_GREY
+    );
+  } else if (
+    alarmReason ==
+    2
+  ) {
+    centeredText(
+      "TIMER",
+      70,
+      4,
+      C_HEADER
+    );
+
+    centeredText(
+      "FINISHED",
+      125,
+      4,
+      C_YELLOW
+    );
+
+    centeredText(
+      "PRESS ANY BUTTON",
+      190,
+      2,
+      C_GREEN
+    );
+  } else {
+    centeredText(
+      "ALERT TEST",
+      70,
+      3,
+      C_RED
+    );
+
+    centeredText(
+      "ACTIVE",
+      125,
+      5,
+      C_YELLOW
+    );
+
+    centeredText(
+      "PRESS ANY BUTTON",
+      190,
+      2
+    );
+  }
+}
+
+// ================================================================
+// DRAW ROUTER
+// ================================================================
+
+void drawCurrentScreen() {
+  switch (
+    currentScreen
+  ) {
+    case SCREEN_HOME:
+      drawHome();
+      break;
+
+    case SCREEN_MENU:
+      drawMenu();
+      break;
+
+    case SCREEN_WEATHER:
+      drawWeatherScreen();
+      break;
+
+    case SCREEN_MED_MENU:
+      drawMedMenu();
+      break;
+
+    case SCREEN_MED_EDIT:
+      drawMedEdit();
+      break;
+
+    case SCREEN_MED_STATUS:
+      drawMedStatus();
+      break;
+
+    case SCREEN_MED_STOCK:
+      drawMedStock();
+      break;
+
+    case SCREEN_TIMER_SELECT:
+      drawTimerSelect();
+      break;
+
+    case SCREEN_TIMER_RUNNING:
+      drawTimerRunning();
+      break;
+
+    case SCREEN_KIT:
+      drawKit();
+      break;
+
+    case SCREEN_PHARMACY_LIST:
+      drawPharmacyList();
+      break;
+
+    case SCREEN_PHARMACY_DETAIL:
+      drawPharmacyDetails();
+      break;
+
+    case SCREEN_EMERGENCY:
+      drawEmergencyScreen();
+      break;
+
+    case SCREEN_AID_MENU:
+      drawAidMenu();
+      break;
+
+    case SCREEN_AID_VIEW:
+      drawAidView();
+      break;
+
+    case SCREEN_LOCATION:
+      drawLocationScreen();
+      break;
+
+    case SCREEN_ALERT_TEST:
+      drawAlertTest();
+      break;
+
+    case SCREEN_DEVICE:
+      drawDevice();
+      break;
+
+    case SCREEN_QR:
+      drawQRScreen();
+      break;
+
+    case SCREEN_ALARM:
+      drawAlarmScreen();
+      break;
+  }
+}
+
+// ================================================================
+// BUTTON HANDLER
+// ================================================================
+
+void handleButtons() {
+  bool confirm =
+    confirmButton.pressed();
+
+  bool clear =
+    clearButton.pressed();
+
+  bool up =
+    upButton.pressed();
+
+  bool down =
+    downButton.pressed();
+
+  if (
+    !confirm &&
+    !clear &&
+    !up &&
+    !down
+  ) {
+    return;
+  }
+
+  clickBeep();
+
+  // ------------------------------------------------------------
+  // ALARM
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_ALARM
+  ) {
+    if (
+      alarmReason ==
+      1
+    ) {
+      if (
+        confirm
+      ) {
+        markMedTaken(
+          activeMedication
+        );
+
+        activeMedication =
+          -1;
+
+        successBeep();
+
+        stopAlarm();
+
+        return;
+      }
+
+      if (
+        up
+      ) {
+        snoozeMed(
+          activeMedication
+        );
+
+        activeMedication =
+          -1;
+
+        stopAlarm();
+
+        return;
+      }
+
+      if (
+        down
+      ) {
+        skipMed(
+          activeMedication
+        );
+
+        activeMedication =
+          -1;
+
+        stopAlarm();
+
+        return;
+      }
+
+      if (
+        clear
+      ) {
+        activeMedication =
+          -1;
+
+        stopAlarm();
+
+        return;
+      }
+    } else {
+      stopAlarm();
+
+      return;
+    }
+  }
+
+  // ------------------------------------------------------------
+  // QR
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_QR
+  ) {
+    if (
+      confirm ||
+      clear
+    ) {
+      currentScreen =
+        qrReturnScreen;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // HOME
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_HOME
+  ) {
+    if (
+      confirm
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // MAIN MENU
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_MENU
+  ) {
+    if (
+      up
+    ) {
+      menuSelection--;
+
+      if (
+        menuSelection <
+        0
+      ) {
+        menuSelection =
+          MENU_COUNT -
+          1;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      menuSelection++;
+
+      if (
+        menuSelection >=
+        MENU_COUNT
+      ) {
+        menuSelection =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_HOME;
+
+      redraw();
+
+      return;
+    }
+
+    if (
+      confirm
+    ) {
+      switch (
+        menuSelection
+      ) {
+        case 0:
+          currentScreen =
+            SCREEN_WEATHER;
+          break;
+
+        case 1:
+          currentScreen =
+            SCREEN_MED_MENU;
+          break;
+
+        case 2:
+          currentScreen =
+            timerRunning
+              ?
+              SCREEN_TIMER_RUNNING
+              :
+              SCREEN_TIMER_SELECT;
+          break;
+
+        case 3:
+          currentScreen =
+            SCREEN_KIT;
+          break;
+
+        case 4:
+          pharmacySearchDone =
+            false;
+
+          pharmacyMessage =
+            "PRESS CONFIRM";
+
+          currentScreen =
+            SCREEN_PHARMACY_LIST;
+          break;
+
+        case 5:
+          currentScreen =
+            SCREEN_EMERGENCY;
+          break;
+
+        case 6:
+          currentScreen =
+            SCREEN_AID_MENU;
+          break;
+
+        case 7:
+          currentScreen =
+            SCREEN_LOCATION;
+          break;
+
+        case 8:
+          currentScreen =
+            SCREEN_ALERT_TEST;
+          break;
+
+        case 9:
+          currentScreen =
+            SCREEN_DEVICE;
+          break;
+      }
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // WEATHER
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_WEATHER
+  ) {
+    if (
+      confirm
+    ) {
+      refreshRequested =
+        true;
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // MED MENU
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_MED_MENU
+  ) {
+    if (
+      up
+    ) {
+      medMenuSelection--;
+
+      if (
+        medMenuSelection <
+        0
+      ) {
+        medMenuSelection =
+          4;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      medMenuSelection++;
+
+      if (
+        medMenuSelection >
+        4
+      ) {
+        medMenuSelection =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+
+      return;
+    }
+
+    if (
+      confirm
+    ) {
+      if (
+        medMenuSelection <
+        3
+      ) {
+        editMedSlot =
+          medMenuSelection;
+
+        editHour =
+          medHour[
+            editMedSlot
+          ];
+
+        editMinute =
+          medMinute[
+            editMedSlot
+          ];
+
+        editMedField =
+          0;
+
+        currentScreen =
+          SCREEN_MED_EDIT;
+
+        redraw();
+
+        return;
+      }
+
+      if (
+        medMenuSelection ==
+        3
+      ) {
+        medStatusSelection =
+          0;
+
+        currentScreen =
+          SCREEN_MED_STATUS;
+
+        redraw();
+
+        return;
+      }
+
+      medStockSelection =
+        0;
+
+      currentScreen =
+        SCREEN_MED_STOCK;
+
+      redraw();
+
+      return;
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // MED EDIT
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_MED_EDIT
+  ) {
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MED_MENU;
+
+      redraw();
+
+      return;
+    }
+
+    if (
+      editMedField ==
+      0
+    ) {
+      if (
+        up
+      ) {
+        editHour++;
+
+        if (
+          editHour >
+          23
+        ) {
+          editHour =
+            0;
+        }
+
+        redraw();
+      }
+
+      if (
+        down
+      ) {
+        editHour--;
+
+        if (
+          editHour <
+          0
+        ) {
+          editHour =
+            23;
+        }
+
+        redraw();
+      }
+
+      if (
+        confirm
+      ) {
+        editMedField =
+          1;
+
+        redraw();
+      }
+
+      return;
+    }
+
+    if (
+      up
+    ) {
+      editMinute +=
+        5;
+
+      if (
+        editMinute >=
+        60
+      ) {
+        editMinute =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      editMinute -=
+        5;
+
+      if (
+        editMinute <
+        0
+      ) {
+        editMinute =
+          55;
+      }
+
+      redraw();
+    }
+
+    if (
+      confirm
+    ) {
+      medHour[
+        editMedSlot
+      ] =
+        editHour;
+
+      medMinute[
+        editMedSlot
+      ] =
+        editMinute;
+
+      medTaken[
+        editMedSlot
+      ] =
+        false;
+
+      medAlerted[
+        editMedSlot
+      ] =
+        false;
+
+      medSkipped[
+        editMedSlot
+      ] =
+        false;
+
+      medSnoozeUntil[
+        editMedSlot
+      ] =
+        0;
+
+      saveMedSchedule();
+      saveMedDay();
+
+      successBeep();
+
+      currentScreen =
+        SCREEN_MED_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // MED STATUS
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_MED_STATUS
+  ) {
+    if (
+      up
+    ) {
+      medStatusSelection--;
+
+      if (
+        medStatusSelection <
+        0
+      ) {
+        medStatusSelection =
+          MED_COUNT -
+          1;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      medStatusSelection++;
+
+      if (
+        medStatusSelection >=
+        MED_COUNT
+      ) {
+        medStatusSelection =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      confirm
+    ) {
+      if (
+        medTaken[
+          medStatusSelection
+        ]
+      ) {
+        medTaken[
+          medStatusSelection
+        ] =
+          false;
+
+        saveMedDay();
+      } else {
+        markMedTaken(
+          medStatusSelection
+        );
+      }
+
+      successBeep();
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MED_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // MED STOCK
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_MED_STOCK
+  ) {
+    if (
+      up
+    ) {
+      medStockSelection--;
+
+      if (
+        medStockSelection <
+        0
+      ) {
+        medStockSelection =
+          MED_COUNT -
+          1;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      medStockSelection++;
+
+      if (
+        medStockSelection >=
+        MED_COUNT
+      ) {
+        medStockSelection =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      confirm
+    ) {
+      if (
+        medStock[
+          medStockSelection
+        ] <
+        0
+      ) {
+        medStock[
+          medStockSelection
+        ] =
+          1;
+      } else {
+        medStock[
+          medStockSelection
+        ]++;
+      }
+
+      saveMedSchedule();
+
+      successBeep();
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MED_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // TIMER SELECT
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_TIMER_SELECT
+  ) {
+    if (
+      up
+    ) {
+      timerSelection--;
+
+      if (
+        timerSelection <
+        0
+      ) {
+        timerSelection =
+          TIMER_COUNT -
+          1;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      timerSelection++;
+
+      if (
+        timerSelection >=
+        TIMER_COUNT
+      ) {
+        timerSelection =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      confirm
+    ) {
+      timerDurationMs =
+        timerPresetSeconds[
+          timerSelection
+        ] *
+        1000UL;
+
+      timerStartedAt =
+        millis();
+
+      timerRunning =
+        true;
+
+      lastTimerSecond =
+        0xFFFFFFFFUL;
+
+      currentScreen =
+        SCREEN_TIMER_RUNNING;
+
+      successBeep();
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // TIMER RUNNING
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_TIMER_RUNNING
+  ) {
+    if (
+      clear
+    ) {
+      timerRunning =
+        false;
+
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // KIT
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_KIT
+  ) {
+    if (
+      up
+    ) {
+      kitSelection--;
+
+      if (
+        kitSelection <
+        0
+      ) {
+        kitSelection =
+          KIT_COUNT -
+          1;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      kitSelection++;
+
+      if (
+        kitSelection >=
+        KIT_COUNT
+      ) {
+        kitSelection =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      confirm
+    ) {
+      kitChecked[
+        kitSelection
+      ] =
+        !kitChecked[
+          kitSelection
+        ];
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // PHARMACY LIST
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_PHARMACY_LIST
+  ) {
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+
+      return;
+    }
+
+    if (
+      !pharmacySearchDone
+    ) {
+      if (
+        confirm
+      ) {
+        searchPharmacies();
+      }
+
+      return;
+    }
+
+    if (
+      pharmacyCount ==
+      0
+    ) {
+      if (
+        confirm
+      ) {
+        searchPharmacies();
+      }
+
+      return;
+    }
+
+    if (
+      up
+    ) {
+      pharmacySelection--;
+
+      if (
+        pharmacySelection <
+        0
+      ) {
+        pharmacySelection =
+          pharmacyCount -
+          1;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      pharmacySelection++;
+
+      if (
+        pharmacySelection >=
+        pharmacyCount
+      ) {
+        pharmacySelection =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      confirm
+    ) {
+      currentScreen =
+        SCREEN_PHARMACY_DETAIL;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // PHARMACY DETAILS
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_PHARMACY_DETAIL
+  ) {
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_PHARMACY_LIST;
+
+      redraw();
+
+      return;
+    }
+
+    if (
+      up
+    ) {
+      String mapUrl =
+        "https://www.google.com/maps/dir/?api=1&destination=";
+
+      mapUrl +=
+        String(
+          pharmacies[
+            pharmacySelection
+          ].lat,
+          6
+        );
+
+      mapUrl +=
+        ",";
+
+      mapUrl +=
+        String(
+          pharmacies[
+            pharmacySelection
+          ].lon,
+          6
+        );
+
+      showQR(
+        mapUrl,
+        "SCAN FOR DIRECTIONS",
+        SCREEN_PHARMACY_DETAIL
+      );
+
+      return;
+    }
+
+    if (
+      confirm
+    ) {
+      String phone =
+        pharmacies[
+          pharmacySelection
+        ].phone;
+
+      if (
+        phone.length()
+      ) {
+        phone =
+          cleanPhone(
+            phone
+          );
+
+        showQR(
+          "tel:" +
+          phone,
+          "SCAN TO CALL",
+          SCREEN_PHARMACY_DETAIL
+        );
+      } else {
+        errorBeep();
+      }
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // EMERGENCY
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_EMERGENCY
+  ) {
+    if (
+      up
+    ) {
+      showQR(
+        emergencyQRText(),
+        "EMERGENCY CARD",
+        SCREEN_EMERGENCY
+      );
+
+      return;
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // FIRST AID MENU
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_AID_MENU
+  ) {
+    if (
+      up
+    ) {
+      aidSelection--;
+
+      if (
+        aidSelection <
+        0
+      ) {
+        aidSelection =
+          AID_COUNT -
+          1;
+      }
+
+      redraw();
+    }
+
+    if (
+      down
+    ) {
+      aidSelection++;
+
+      if (
+        aidSelection >=
+        AID_COUNT
+      ) {
+        aidSelection =
+          0;
+      }
+
+      redraw();
+    }
+
+    if (
+      confirm
+    ) {
+      currentScreen =
+        SCREEN_AID_VIEW;
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // AID VIEW
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_AID_VIEW
+  ) {
+    if (
+      confirm ||
+      clear
+    ) {
+      currentScreen =
+        SCREEN_AID_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // LOCATION
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_LOCATION
+  ) {
+    if (
+      confirm
+    ) {
+      locationReady =
+        false;
+
+      weatherReady =
+        false;
+
+      fetchIPLocation();
+
+      if (
+        locationReady
+      ) {
+        fetchWeather();
+      }
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // ALERT TEST
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_ALERT_TEST
+  ) {
+    if (
+      confirm
+    ) {
+      startAlarm(
+        3
+      );
+
+      return;
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // DEVICE
+  // ------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_DEVICE
+  ) {
+    if (
+      confirm
+    ) {
+      connectWiFi();
+
+      if (
+        WiFi.isConnected()
+      ) {
+        startClock();
+
+        refreshRequested =
+          true;
+      }
+
+      redraw();
+
+      return;
+    }
+
+    if (
+      up
+    ) {
+      lightTheme =
+        !lightTheme;
+
+      prefs.putBool(
+        "light",
+        lightTheme
+      );
+
+      redraw();
+    }
+
+    if (
+      clear
+    ) {
+      currentScreen =
+        SCREEN_MENU;
+
+      redraw();
+    }
+
+    return;
+  }
+}
+
+// ================================================================
+// SERIAL STATUS
+// ================================================================
+
+void printStatus() {
+  Serial.println();
+
+  Serial.println(
+    "========== MEDKIT V4.7 =========="
+  );
+
+  Serial.print(
+    "WiFi: "
+  );
+
+  Serial.println(
+    wifiStatusText()
+  );
+
+  if (
+    WiFi.isConnected()
+  ) {
+    Serial.print(
+      "SSID: "
+    );
+
+    Serial.println(
+      WiFi.SSID()
+    );
+
+    Serial.print(
+      "IP: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+    Serial.print(
+      "RSSI: "
+    );
+
+    Serial.println(
+      WiFi.RSSI()
+    );
+  }
+
+  Serial.print(
+    "Clock: "
+  );
+
+  Serial.println(
+    clockReady
+      ?
+      "READY"
+      :
+      "WAIT"
+  );
+
+  Serial.print(
+    "Location: "
+  );
+
+  Serial.println(
+    locationReady
+      ?
+      locationName
+      :
+      "NOT READY"
+  );
+
+  Serial.print(
+    "Coordinates: "
+  );
+
+  Serial.print(
+    latitude,
+    6
+  );
+
+  Serial.print(
+    ", "
+  );
+
+  Serial.println(
+    longitude,
+    6
+  );
+
+  Serial.print(
+    "Weather: "
+  );
+
+  Serial.println(
+    weatherReady
+      ?
+      weatherText
+      :
+      "NOT READY"
+  );
+
+  Serial.println(
+    "================================="
+  );
+
+  Serial.println();
+}
+
+// ================================================================
+// SERIAL COMMANDS
+// ================================================================
+
+void processSerial(
+  String command
+) {
+  command.trim();
+
+  if (
+    !command.length()
+  ) {
+    return;
+  }
+
+  Serial.print(
+    "COMMAND: "
+  );
+
+  Serial.println(
+    command
+  );
+
+  if (
+    command ==
+    "STATUS"
+  ) {
+    printStatus();
+
+    return;
+  }
+
+  if (
+    command ==
+    "WIFI"
+  ) {
+    connectWiFi();
+
+    return;
+  }
+
+  if (
+    command ==
+    "REFRESH"
+  ) {
+    refreshRequested =
+      true;
+
+    return;
+  }
+
+  if (
+    command ==
+    "LOCATIONAPI"
+  ) {
+    fetchIPLocation();
+
+    return;
+  }
+
+  if (
+    command ==
+    "WEATHER"
+  ) {
+    fetchWeather();
+
+    return;
+  }
+
+  if (
+    command ==
+    "PHARMACY"
+  ) {
+    searchPharmacies();
+
+    return;
+  }
+
+  if (
+    command ==
+    "BEEP"
+  ) {
+    successBeep();
+
+    return;
+  }
+
+  if (
+    command ==
+    "THEME"
+  ) {
+    lightTheme =
+      !lightTheme;
+
+    prefs.putBool(
+      "light",
+      lightTheme
+    );
+
+    redraw();
+
+    return;
+  }
+
+  if (
+    command ==
+    "RESETMEDS"
+  ) {
+    int today =
+      todayKey();
+
+    if (
+      today >=
+      0
+    ) {
+      resetMedicationDay(
+        today
+      );
+    }
+
+    return;
+  }
+
+  if (
+    command ==
+    "DEFAULTMEDS"
+  ) {
+    medHour[0] = 8;
+    medMinute[0] = 0;
+
+    medHour[1] = 13;
+    medMinute[1] = 0;
+
+    medHour[2] = 20;
+    medMinute[2] = 0;
+
+    saveMedSchedule();
+
+    redraw();
+
+    return;
+  }
+
+  if (
+    command ==
+    "CLEARLOCATION"
+  ) {
+    prefs.remove(
+      "hasloc"
+    );
+
+    prefs.remove(
+      "locname"
+    );
+
+    prefs.remove(
+      "region"
+    );
+
+    prefs.remove(
+      "country"
+    );
+
+    prefs.remove(
+      "timezone"
+    );
+
+    prefs.remove(
+      "lat"
+    );
+
+    prefs.remove(
+      "lon"
+    );
+
+    locationReady =
+      false;
+
+    manualLocation =
+      false;
+
+    weatherReady =
+      false;
+
+    redraw();
+
+    return;
+  }
+
+  if (
+    command.startsWith(
+      "LOCATION="
+    )
+  ) {
+    String search =
+      command.substring(
+        9
+      );
+
+    if (
+      geocodeLocation(
+        search
+      )
+    ) {
+      fetchWeather();
+
+      successBeep();
+    } else {
+      Serial.println(
+        "LOCATION SEARCH FAILED"
+      );
+
+      errorBeep();
+    }
+
+    return;
+  }
+
+  if (
+    command.startsWith(
+      "STOCK"
+    )
+  ) {
+    int equals =
+      command.indexOf(
+        '='
+      );
+
+    if (
+      equals >
+      5
+    ) {
+      int index =
+        command.substring(
+          5,
+          equals
+        ).toInt();
+
+      int value =
+        command.substring(
+          equals +
+          1
+        ).toInt();
+
+      if (
+        index >=
+        0 &&
+        index <
+        MED_COUNT
+      ) {
+        medStock[index] =
+          value;
+
+        saveMedSchedule();
+
+        redraw();
+      }
+    }
+
+    return;
+  }
+
+  if (
+    command.startsWith(
+      "LOW"
+    )
+  ) {
+    int equals =
+      command.indexOf(
+        '='
+      );
+
+    if (
+      equals >
+      3
+    ) {
+      int index =
+        command.substring(
+          3,
+          equals
+        ).toInt();
+
+      int value =
+        command.substring(
+          equals +
+          1
+        ).toInt();
+
+      if (
+        index >=
+        0 &&
+        index <
+        MED_COUNT
+      ) {
+        medLow[index] =
+          value;
+
+        saveMedSchedule();
+
+        redraw();
+      }
+    }
+
+    return;
+  }
+
+  if (
+    command.startsWith(
+      "CARDNAME="
+    )
+  ) {
+    cardName =
+      command.substring(
+        9
+      );
+
+    prefs.putString(
+      "cardname",
+      cardName
+    );
+
+    return;
+  }
+
+  if (
+    command.startsWith(
+      "CARDCONTACT="
+    )
+  ) {
+    cardContact =
+      command.substring(
+        12
+      );
+
+    prefs.putString(
+      "cardcontact",
+      cardContact
+    );
+
+    return;
+  }
+
+  if (
+    command.startsWith(
+      "CARDALLERGIES="
+    )
+  ) {
+    cardAllergies =
+      command.substring(
+        14
+      );
+
+    prefs.putString(
+      "allergies",
+      cardAllergies
+    );
+
+    return;
+  }
+
+  if (
+    command.startsWith(
+      "CARDMEDS="
+    )
+  ) {
+    cardMeds =
+      command.substring(
+        9
+      );
+
+    prefs.putString(
+      "cardmeds",
+      cardMeds
+    );
+
+    return;
+  }
+
+  if (
+    command.startsWith(
+      "ICEPHONE="
+    )
+  ) {
+    emergencyPhone =
+      command.substring(
+        9
+      );
+
+    prefs.putString(
+      "icephone",
+      emergencyPhone
+    );
+
+    return;
+  }
+
+  Serial.println(
+    "UNKNOWN COMMAND"
+  );
+}
+
+void serviceSerial() {
+  while (
+    Serial.available()
+  ) {
+    char c =
+      Serial.read();
+
+    if (
+      c ==
+      '\n' ||
+      c ==
+      '\r'
+    ) {
+      if (
+        serialBuffer.length()
+      ) {
+        processSerial(
+          serialBuffer
+        );
+
+        serialBuffer =
+          "";
+      }
+    } else {
+      serialBuffer += c;
+    }
+  }
+}
+
+// ================================================================
+// BOOT
+// ================================================================
+
+void drawBoot() {
+  clearDisplay();
+
+  centeredText(
+    "MEDKIT",
+    43,
+    5,
+    C_HEADER
+  );
+
+  centeredText(
+    "V4.7",
+    105,
+    3,
+    C_GREEN
+  );
+
+  centeredText(
+    "OLD API BUILD",
+    150,
+    2,
+    C_YELLOW
+  );
+
+  centeredText(
+    "DIRECT WIFI",
+    181,
+    1,
+    C_GREY
+  );
+
+  tft.drawRoundRect(
+    20,
+    210,
+    200,
+    14,
+    6,
+    C_HEADER
+  );
+
+  for (
+    int width = 0;
+    width <= 194;
+    width += 8
+  ) {
+    tft.fillRoundRect(
+      23,
+      213,
+      width,
+      8,
+      4,
+      C_GREEN
+    );
+
+    delay(8);
+  }
+
+  successBeep();
+
+  delay(250);
+}
+
+// ================================================================
+// SETUP
+// ================================================================
+
+void setup() {
+  Serial.begin(
+    115200
+  );
+
+  delay(500);
+
+  Serial.println();
+
+  Serial.println(
+    "============================="
+  );
+
+  Serial.println(
+    "MEDKIT V4.7"
+  );
+
+  Serial.println(
+    "XIAO ESP32-S3"
+  );
+
+  Serial.println(
+    "DIRECT WIFI + OLD APIs"
+  );
+
+  Serial.println(
+    "============================="
+  );
+
+  prefs.begin(
+    "medkit",
+    false
+  );
+
+  lightTheme =
+    prefs.getBool(
+      "light",
+      false
+    );
+
+  loadMedSchedule();
+
+  loadEmergency();
+
+  loadLocation();
+
+  confirmButton.begin(
+    BTN_CONFIRM
+  );
+
+  clearButton.begin(
+    BTN_CLEAR
+  );
+
+  upButton.begin(
+    BTN_UP
+  );
+
+  downButton.begin(
+    BTN_DOWN
+  );
+
+  setupBuzzer();
+
+  pinMode(
+    TFT_BL,
+    OUTPUT
+  );
+
+  digitalWrite(
+    TFT_BL,
+    HIGH
+  );
+
+  SPI.begin(
+    TFT_SCLK,
+    -1,
+    TFT_MOSI,
+    TFT_CS
+  );
+
+  tft.init(
+    240,
+    240
+  );
+
+  tft.setRotation(
+    0
+  );
+
+  tft.setSPISpeed(
+    40000000
+  );
+
+  drawBoot();
+
+  connectWiFi();
+
+  if (
+    WiFi.isConnected()
+  ) {
+    startClock();
+
+    refreshRequested =
+      true;
+  }
+
+  currentScreen =
+    SCREEN_HOME;
+
+  redraw();
+
+  Serial.println(
+    "MEDKIT READY"
+  );
+}
+
+// ================================================================
+// LOOP
+// ================================================================
+
+void loop() {
+  confirmButton.update();
+  clearButton.update();
+  upButton.update();
+  downButton.update();
+
+  handleButtons();
+
+  serviceSerial();
+
+  serviceWiFi();
+
+  serviceClock();
+
+  serviceInternet();
+
+  static bool medStateLoaded =
+    false;
+
+  if (
+    clockReady &&
+    !medStateLoaded
+  ) {
+    loadMedDay();
+
+    medStateLoaded =
+      true;
+
+    redraw();
+  }
+
+  serviceMedication();
+
+  serviceTimer();
+
+  serviceAlarm();
+
+  // --------------------------------------------------------------
+  // CLOCK REDRAW
+  // --------------------------------------------------------------
+
+  if (
+    clockReady &&
+    currentScreen !=
+    SCREEN_QR &&
+    currentScreen !=
+    SCREEN_ALARM
+  ) {
+    struct tm info;
+
+    if (
+      getLocalTime(
+        &info,
+        1
+      )
+    ) {
+      int minuteKey =
+        info.tm_hour *
+        60 +
+        info.tm_min;
+
+      if (
+        minuteKey !=
+        lastClockMinute
+      ) {
+        lastClockMinute =
+          minuteKey;
+
+        if (
+          currentScreen ==
+          SCREEN_HOME
+        ) {
+          redraw();
+        } else if (
+          currentScreen !=
+          SCREEN_TIMER_RUNNING
+        ) {
+          drawTopBar();
+        }
+      }
+    }
+  }
+
+  // --------------------------------------------------------------
+  // TIMER AREA ONLY
+  // --------------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_TIMER_RUNNING &&
+    timerRunning
+  ) {
+    unsigned long second =
+      (
+        millis() -
+        timerStartedAt
+      ) /
+      1000UL;
+
+    if (
+      second !=
+      lastTimerSecond
+    ) {
+      lastTimerSecond =
+        second;
+
+      updateTimerArea();
+    }
+  }
+
+  // --------------------------------------------------------------
+  // FULL REDRAW ONLY WHEN NEEDED
+  // --------------------------------------------------------------
+
+  if (
+    uiDirty
+  ) {
+    uiDirty =
+      false;
+
+    drawCurrentScreen();
+  }
+
+  delay(2);
+}
