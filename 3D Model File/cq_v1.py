@@ -5,6 +5,7 @@ All units are millimeters. Hinge tolerances require physical print testing.
 import cadquery as cq
 from pathlib import Path
 
+
 # -------------------- CONFIGURATION --------------------
 LENGTH = 236.0
 WIDTH = 95.0
